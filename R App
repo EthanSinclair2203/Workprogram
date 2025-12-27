@@ -920,6 +920,30 @@ build_source_matrix <- function(source_data, target_issuer) {
     select(-counterparty_sector)
 }
 
+build_transactions_matrix <- function(source_data, target_issuer) {
+  if (is.null(source_data) || nrow(source_data) == 0) {
+    return(data.frame(Type = character(), Sector = character()))
+  }
+  
+  df <- source_data %>%
+    filter(issuer_sector == target_issuer) %>%
+    group_by(counterparty_sector, qtr) %>%
+    summarise(value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+    mutate(
+      Type = if_else(counterparty_sector == "000", "T", "A"),
+      Sector = if_else(counterparty_sector == "000", target_issuer, counterparty_sector)
+    )
+  
+  if (nrow(df) == 0) return(data.frame(Type = character(), Sector = character()))
+  
+  mat <- build_wide_matrix(df, "value", c("Type", "Sector", "counterparty_sector"))
+  if (nrow(mat) == 0) return(data.frame(Type = character(), Sector = character()))
+  
+  mat %>%
+    arrange(Type != "T", Sector) %>%
+    select(-counterparty_sector)
+}
+
 build_residual_row <- function(source_data, target_issuer) {
   if (is.null(source_data) || nrow(source_data) == 0) {
     return(data.frame(Type = "Residual", Sector = ""))
@@ -1333,7 +1357,7 @@ function(settings) {
 issuance_row_callback <- JS("
 function(row, data, index) {
   if (data && data.length > 0) {
-    if (data[0] && data[0].toString() === 'L') {
+    if (data[0] && (data[0].toString() === 'L' || data[0].toString() === 'T')) {
       $(row).addClass('issuance-row');
     }
     if (data[0] && data[0].toString() === 'Residual') {
@@ -2025,6 +2049,9 @@ ui <- fluidPage(
       
       div(class = "panel-header", "Revisions (Current − Old)"),
       div(class = "table-container-fixed", DTOutput("tbl_rev")),
+
+      div(class = "panel-header", "Transactions"),
+      div(class = "table-container-fixed", DTOutput("tbl_transactions")),
       
       div(class = "panel-header", "Notes & Comments"),
       div(class = "info-box", style = "font-size: 0.85em; margin-bottom: 10px;",
@@ -3279,6 +3306,88 @@ server <- function(input, output, session) {
                     ),
                     rownames = FALSE, width = "100%")
     if (ncol(mat) > 2) dt <- formatRound(dt, columns = 3:ncol(mat), digits = 0)
+    dt
+  })
+
+  output$tbl_transactions <- renderDT({
+    iss <- selected_iss()
+    
+    if (isTRUE(rv$viewing_snapshot) && !is.null(rv$snapshot_data$final_data)) {
+      snap_data <- rv$snapshot_data$final_data
+      
+      if (is.null(iss) || iss == "" || !iss %in% unique(snap_data$issuer_sector)) {
+        return(datatable(data.frame(Message = "No snapshot data for this issuer"),
+                         options = list(dom = "t"), rownames = FALSE))
+      }
+      
+      mat <- snap_data %>%
+        filter(issuer_sector == iss) %>%
+        group_by(counterparty_sector, qtr) %>%
+        summarise(value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+        mutate(
+          Type = if_else(counterparty_sector == "000", "T", "A"),
+          Sector = if_else(counterparty_sector == "000", iss, counterparty_sector)
+        )
+      
+      if (nrow(mat) == 0) {
+        return(datatable(data.frame(Message = "No data"), options = list(dom = "t"), rownames = FALSE))
+      }
+      
+      mat <- build_wide_matrix(mat, "value", c("Type", "Sector", "counterparty_sector"))
+      mat <- mat %>% arrange(Type != "T", Sector) %>% select(-counterparty_sector)
+      mat <- add_qoq_columns(mat)
+      
+      change_col <- which(names(mat) == "Change")
+      qtr_cols <- which(grepl("^[A-Za-z]{3}-\\d{2}$", names(mat)))
+      format_cols <- c(qtr_cols, change_col)
+      
+      dt <- datatable(mat,
+                      extensions = 'FixedColumns',
+                      selection = "none",
+                      options = list(
+                        scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                        fixedColumns = list(leftColumns = 2),
+                        columnDefs = list(list(className = "dt-right", targets = "_all")),
+                        rowCallback = issuance_row_callback,
+                        initComplete = scroll_right_callback
+                      ),
+                      rownames = FALSE, width = "100%",
+                      caption = "SNAPSHOT VIEW - Transactions")
+      
+      if (length(format_cols) > 0) dt <- formatRound(dt, columns = format_cols, digits = 0)
+      return(dt)
+    }
+    
+    cl <- current_levels()
+    if (is.null(cl) || is.null(iss) || iss == "") {
+      return(datatable(data.frame(Message = "Loading..."), options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    mat <- tryCatch(build_transactions_matrix(cl, iss),
+                    error = function(e) data.frame(Message = paste("Error:", e$message)))
+    if (nrow(mat) == 0 || "Message" %in% names(mat)) {
+      return(datatable(if ("Message" %in% names(mat)) mat else data.frame(Message = "No data"),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    mat <- add_qoq_columns(mat)
+    
+    change_col <- which(names(mat) == "Change")
+    qtr_cols <- which(grepl("^[A-Za-z]{3}-\\d{2}$", names(mat)))
+    format_cols <- c(qtr_cols, change_col)
+    
+    dt <- datatable(mat,
+                    extensions = 'FixedColumns',
+                    selection = "none",
+                    options = list(
+                      scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                      fixedColumns = list(leftColumns = 2),
+                      columnDefs = list(list(className = "dt-right", targets = "_all")),
+                      rowCallback = issuance_row_callback,
+                      initComplete = scroll_right_callback
+                    ),
+                    rownames = FALSE, width = "100%")
+    if (length(format_cols) > 0) dt <- formatRound(dt, columns = format_cols, digits = 0)
     dt
   })
   
