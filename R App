@@ -1,0 +1,3420 @@
+# ============================================================
+# ET27 Time Series Review, Adjustments, and Revisions App
+# Version: 2.1 (quarter exclusion removed)
+# ============================================================
+
+# ============================================================
+# PART 00 — PACKAGES
+# ============================================================
+library(shiny)
+library(DT)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(readxl)
+library(readr)
+library(tibble)
+library(shinyWidgets)
+library(openxlsx)
+
+# ============================================================
+# PART 01 — CONFIGURATION
+# ============================================================
+
+# Default input folder path - set this to your ET27 workbooks location
+DEFAULT_INPUT_FOLDER <- "F:/Short Term R"
+
+# Default adjustments log path
+DEFAULT_LOG_PATH <- file.path(DEFAULT_INPUT_FOLDER, "adjustments_log.csv")
+
+# ============================================================
+# PART 02 — QUARTER HELPERS (MMM-YY)
+# ============================================================
+
+#' Parse quarter label to standardized format (MMM-YY)
+parse_quarter_label <- function(x) {
+  x <- str_trim(as.character(x))
+  x <- str_replace_all(x, "\\s+", " ")
+  x <- str_to_title(x)
+  # Handle various formats: "Jun 88", "JUN 88", "Jun-88", "JUN-88"
+  x <- str_replace(x, "^([A-Za-z]{3})\\s*[-]?\\s*(\\d{2})$", "\\1-\\2")
+  x
+}
+
+#' Convert MMM-YY label to quarter-end Date
+qtr_end_from_mmm_yy <- function(x) {
+  x <- parse_quarter_label(x)
+  d <- suppressWarnings(lubridate::parse_date_time(x, orders = "b-y", locale = "C"))
+  if (any(is.na(d))) {
+    warning("Failed to parse some quarter label(s). Expected format: 'Jun-88'")
+    return(as.Date(rep(NA, length(x))))
+  }
+  ceiling_date(as.Date(d), "month") - days(1)
+}
+
+#' Format Date as MMM-YY label
+format_mmm_yy <- function(d) {
+  format(d, "%b-%y")
+}
+
+#' Calculate revision window based on edit quarter
+#' - June edit quarter: 15 quarters back
+#' - Other quarters: 8 quarters back
+revision_window <- function(edit_qtr_end) {
+  edit_qtr_end <- as.Date(edit_qtr_end)
+  m <- month(edit_qtr_end)
+  
+  if (!m %in% c(3, 6, 9, 12)) {
+    warning("Edit quarter is not a standard quarter-end month (Mar/Jun/Sep/Dec).")
+  }
+  
+  n_qtrs <- if (m == 6) 15 else 8
+  
+  # Snap to quarter end, then subtract n_qtrs quarters
+  edit_qtr_end <- ceiling_date(floor_date(edit_qtr_end, "quarter"), "quarter") - days(1)
+  start_qtr_end <- edit_qtr_end %m-% months(3 * n_qtrs)
+  
+  list(start = start_qtr_end, end = edit_qtr_end, n_quarters = n_qtrs)
+}
+
+#' Safe grepl that handles NAs (returns FALSE for NA)
+safe_grepl <- function(pattern, x, ...) {
+  result <- grepl(pattern, x, ...)
+  result[is.na(result) | is.na(x)] <- FALSE
+  result
+}
+
+#' Get ordered quarter labels from dates
+get_ordered_quarters <- function(qtr_labels) {
+  valid <- qtr_labels[safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtr_labels)]
+  if (length(valid) == 0) return(character(0))
+  
+  dates <- qtr_end_from_mmm_yy(valid)
+  valid[order(dates)]
+}
+
+# ============================================================
+# PART 03 — LIABILITY CODE PARSING
+#   Format: L.<class>.<instrument>.L.<issuer>.<counterparty>
+#   Example: L.B.420.L.111.233
+# ============================================================
+
+CODE_REGEX <- "^L\\.([A-Za-z])\\.(\\d{3})\\.L\\.(\\d{3})\\.(\\d{3})$"
+
+#' Parse liability code into components
+parse_code_parts <- function(code_chr) {
+  m <- str_match(code_chr, CODE_REGEX)
+  tibble(
+    inst_class = m[, 2],
+    instrument = m[, 3],
+    issuer_sector = sprintf("%03d", as.integer(m[, 4])),
+    counterparty_sector = sprintf("%03d", as.integer(m[, 5]))
+  )
+}
+
+#' Validate if string is a valid liability code
+is_valid_code <- function(code_chr) {
+  result <- str_detect(code_chr, CODE_REGEX)
+  result[is.na(result)] <- FALSE
+  result
+}
+
+# ============================================================
+# PART 04 — EXCEL INGESTION
+# ============================================================
+
+#' Detect quarter label row in Excel header
+detect_quarter_row <- function(path, sheet, max_rows = 10) {
+  hdr <- read_excel(path, sheet = sheet, col_names = FALSE, n_max = max_rows)
+  
+  qtr_pattern <- "^[A-Za-z]{3}\\s*[-]?\\s*\\d{2}$"
+  
+  best_row <- 1
+  best_count <- 0
+  
+  for (i in 1:nrow(hdr)) {
+    row_vals <- as.character(hdr[i, ])
+    matches <- sum(str_detect(row_vals, qtr_pattern), na.rm = TRUE)
+    if (matches > best_count) {
+      best_count <- matches
+      best_row <- i
+    }
+  }
+  
+  best_row
+}
+
+#' Build long-format time series from Excel sheet
+build_long_from_sheet <- function(path, sheet, header_row = NULL) {
+  
+  if (is.null(header_row)) {
+    header_row <- detect_quarter_row(path, sheet)
+  }
+  
+  hdr <- read_excel(path, sheet = sheet, col_names = FALSE, skip = header_row - 1, n_max = 1)
+  raw <- read_excel(path, sheet = sheet, col_names = FALSE, skip = header_row)
+  
+  if (nrow(raw) == 0) {
+    return(tibble(
+      inst_class = character(),
+      instrument = character(),
+      issuer_sector = character(),
+      counterparty_sector = character(),
+      qtr = character(),
+      value = double()
+    ))
+  }
+  
+  code_col_idx <- NULL
+  for (i in 1:min(10, ncol(raw))) {
+    col_vals <- as.character(raw[[i]])
+    match_rate <- mean(is_valid_code(col_vals), na.rm = TRUE)
+    if (match_rate >= 0.15) {
+      code_col_idx <- i
+      break
+    }
+  }
+  
+  if (is.null(code_col_idx)) {
+    warning(paste0("Could not detect liability code column on sheet '", sheet, "'."))
+    return(tibble(
+      inst_class = character(),
+      instrument = character(),
+      issuer_sector = character(),
+      counterparty_sector = character(),
+      qtr = character(),
+      value = double()
+    ))
+  }
+  
+  qtr_pattern <- "^[A-Za-z]{3}\\s*[-]?\\s*\\d{2}$"
+  qtr_col_indices <- c()
+  qtr_labels <- c()
+  
+  for (i in (code_col_idx + 1):ncol(raw)) {
+    col_vals <- raw[[i]]
+    numeric_vals <- suppressWarnings(as.numeric(as.character(col_vals)))
+    numeric_rate <- mean(!is.na(numeric_vals), na.rm = TRUE)
+    
+    header_val <- if (i <= ncol(hdr)) as.character(hdr[[i]]) else ""
+    header_val <- ifelse(is.na(header_val), "", header_val)
+    is_qtr_header <- str_detect(header_val, qtr_pattern)
+    is_qtr_header <- isTRUE(is_qtr_header)
+    
+    if (numeric_rate >= 0.20 || is_qtr_header) {
+      qtr_col_indices <- c(qtr_col_indices, i)
+      if (is_qtr_header) {
+        qtr_labels <- c(qtr_labels, parse_quarter_label(header_val))
+      } else {
+        qtr_labels <- c(qtr_labels, paste0("Q", length(qtr_col_indices)))
+      }
+    }
+  }
+  
+  if (length(qtr_col_indices) == 0) {
+    warning(paste0("No quarter columns detected on sheet '", sheet, "'."))
+    return(tibble(
+      inst_class = character(),
+      instrument = character(),
+      issuer_sector = character(),
+      counterparty_sector = character(),
+      qtr = character(),
+      value = double()
+    ))
+  }
+  
+  df <- raw %>%
+    select(all_of(c(code_col_idx, qtr_col_indices))) %>%
+    setNames(c("code", qtr_labels)) %>%
+    mutate(code = as.character(code)) %>%
+    filter(is_valid_code(code))
+  
+  if (nrow(df) == 0) {
+    return(tibble(
+      inst_class = character(),
+      instrument = character(),
+      issuer_sector = character(),
+      counterparty_sector = character(),
+      qtr = character(),
+      value = double()
+    ))
+  }
+  
+  df_long <- df %>%
+    pivot_longer(-code, names_to = "qtr", values_to = "value") %>%
+    mutate(
+      qtr = parse_quarter_label(qtr),
+      value = suppressWarnings(as.numeric(as.character(value)))
+    ) %>%
+    filter(!is.na(value), safe_grepl("^[A-Za-z]{3}-\\d{2}$", qtr))
+  
+  parts <- parse_code_parts(df_long$code)
+  
+  bind_cols(df_long %>% select(-code), parts) %>%
+    select(inst_class, instrument, issuer_sector, counterparty_sector, qtr, value) %>%
+    arrange(inst_class, instrument, issuer_sector, counterparty_sector, qtr)
+}
+
+#' Discover relevant sheets in workbook
+discover_sheets <- function(path) {
+  sheets <- excel_sheets(path)
+  sheets_lower <- tolower(sheets)
+  
+  safe_detect <- function(x, pattern) {
+    result <- str_detect(x, pattern)
+    result[is.na(result)] <- FALSE
+    result
+  }
+  
+  levels_current <- NULL
+  levels_old <- NULL
+  
+  current_patterns <- c("et27l_millions$", "et27l$", "levels$", "current")
+  for (pat in current_patterns) {
+    matches <- sheets[safe_detect(sheets_lower, pat) & !safe_detect(sheets_lower, "old|prev")]
+    if (length(matches) > 0) {
+      levels_current <- matches[1]
+      break
+    }
+  }
+  
+  old_patterns <- c("et27l_millions_old", "et27l_millions_prev", "old", "prev")
+  for (pat in old_patterns) {
+    matches <- sheets[safe_detect(sheets_lower, pat)]
+    if (length(matches) > 0) {
+      levels_old <- matches[1]
+      break
+    }
+  }
+  
+  if (is.null(levels_current)) {
+    levels_current <- sheets[1]
+  }
+  
+  list(
+    levels_current = levels_current,
+    levels_old = levels_old,
+    all_sheets = sheets
+  )
+}
+
+#' Load all data from a workbook
+load_workbook <- function(path) {
+  sheets <- discover_sheets(path)
+  
+  levels_cur <- tryCatch(
+    build_long_from_sheet(path, sheets$levels_current) %>% mutate(vintage = "current"),
+    error = function(e) {
+      warning(paste0("Error loading current levels: ", e$message))
+      tibble(inst_class = character(), instrument = character(),
+             issuer_sector = character(), counterparty_sector = character(),
+             qtr = character(), value = double(), vintage = character())
+    }
+  )
+  
+  levels_old <- if (!is.null(sheets$levels_old)) {
+    tryCatch(
+      build_long_from_sheet(path, sheets$levels_old) %>% mutate(vintage = "old"),
+      error = function(e) {
+        warning(paste0("Error loading old levels: ", e$message))
+        tibble(inst_class = character(), instrument = character(),
+               issuer_sector = character(), counterparty_sector = character(),
+               qtr = character(), value = double(), vintage = character())
+      }
+    )
+  } else {
+    tibble(inst_class = character(), instrument = character(),
+           issuer_sector = character(), counterparty_sector = character(),
+           qtr = character(), value = double(), vintage = character())
+  }
+  
+  list(
+    current = levels_cur,
+    old = levels_old,
+    sheets = sheets
+  )
+}
+
+#' Load all workbooks from a folder
+load_all_workbooks <- function(folder_path) {
+  xlsx_files <- list.files(folder_path, pattern = "\\.xlsx$", full.names = TRUE)
+  
+  if (length(xlsx_files) == 0) {
+    return(list(
+      current = tibble(inst_class = character(), instrument = character(),
+                       issuer_sector = character(), counterparty_sector = character(),
+                       qtr = character(), value = double(), vintage = character()),
+      old = tibble(inst_class = character(), instrument = character(),
+                   issuer_sector = character(), counterparty_sector = character(),
+                   qtr = character(), value = double(), vintage = character()),
+      files = character()
+    ))
+  }
+  
+  all_current <- list()
+  all_old <- list()
+  
+  for (f in xlsx_files) {
+    wb_data <- load_workbook(f)
+    all_current[[f]] <- wb_data$current
+    all_old[[f]] <- wb_data$old
+  }
+  
+  list(
+    current = bind_rows(all_current),
+    old = bind_rows(all_old),
+    files = basename(xlsx_files)
+  )
+}
+
+# ============================================================
+# PART 05 — ADJUSTMENTS LOG MANAGEMENT
+# ============================================================
+
+ensure_log_file <- function(path) {
+  if (!file.exists(path)) {
+    dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+    write.csv(
+      data.frame(
+        inst_class = character(),
+        instrument = character(),
+        issuer_sector = character(),
+        counterparty_sector = character(),
+        qtr = character(),
+        adj_delta = numeric(),
+        asof = character(),
+        stringsAsFactors = FALSE
+      ),
+      path,
+      row.names = FALSE
+    )
+  }
+}
+
+read_adjustments_log <- function(path) {
+  ensure_log_file(path)
+  df <- tryCatch(read.csv(path, stringsAsFactors = FALSE), error = function(e) NULL)
+  
+  empty_result <- tibble(
+    inst_class = character(),
+    instrument = character(),
+    issuer_sector = character(),
+    counterparty_sector = character(),
+    qtr = character(),
+    adj_delta = double(),
+    asof = character()
+  )
+  
+  if (is.null(df) || nrow(df) == 0) {
+    return(empty_result)
+  }
+  
+  required_cols <- c("inst_class", "instrument", "issuer_sector", "counterparty_sector", "qtr", "adj_delta", "asof")
+  if (!all(required_cols %in% names(df))) {
+    message("Adjustments log missing required columns. Found: ", paste(names(df), collapse = ", "))
+    return(empty_result)
+  }
+  
+  tryCatch({
+    as_tibble(df) %>%
+      mutate(
+        inst_class = as.character(inst_class),
+        instrument = as.character(instrument),
+        issuer_sector = sprintf("%03d", as.integer(issuer_sector)),
+        counterparty_sector = sprintf("%03d", as.integer(counterparty_sector)),
+        qtr = as.character(qtr),
+        adj_delta = as.numeric(adj_delta),
+        asof = as.character(asof)
+      )
+  }, error = function(e) {
+    message("Error parsing adjustments log: ", e$message)
+    empty_result
+  })
+}
+
+append_adjustment <- function(path, inst_class, instrument, issuer_sector,
+                              counterparty_sector, qtr, adj_delta) {
+  ensure_log_file(path)
+  row <- data.frame(
+    inst_class = inst_class,
+    instrument = instrument,
+    issuer_sector = issuer_sector,
+    counterparty_sector = counterparty_sector,
+    qtr = qtr,
+    adj_delta = as.numeric(adj_delta),
+    asof = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    stringsAsFactors = FALSE
+  )
+  write.table(row, path, sep = ",", col.names = FALSE, row.names = FALSE, append = TRUE)
+}
+
+latest_adjustments <- function(adj_log) {
+  if (nrow(adj_log) == 0) {
+    return(tibble(
+      inst_class = character(),
+      instrument = character(),
+      issuer_sector = character(),
+      counterparty_sector = character(),
+      qtr = character(),
+      adj_delta = double()
+    ))
+  }
+  
+  adj_log <- adj_log %>%
+    filter(safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtr)) %>%
+    mutate(qtr = parse_quarter_label(qtr))
+  
+  if (nrow(adj_log) == 0) {
+    return(tibble(
+      inst_class = character(),
+      instrument = character(),
+      issuer_sector = character(),
+      counterparty_sector = character(),
+      qtr = character(),
+      adj_delta = double()
+    ))
+  }
+  
+  adj_log %>%
+    mutate(
+      qtr_end = qtr_end_from_mmm_yy(qtr),
+      asof_ts = suppressWarnings(as.POSIXct(asof, tz = "UTC"))
+    ) %>%
+    arrange(inst_class, instrument, issuer_sector, counterparty_sector,
+            qtr_end, desc(asof_ts)) %>%
+    distinct(inst_class, instrument, issuer_sector, counterparty_sector, qtr,
+             .keep_all = TRUE) %>%
+    select(inst_class, instrument, issuer_sector, counterparty_sector, qtr, adj_delta)
+}
+
+# ============================================================
+# PART 06 — QUARTER-END SNAPSHOTS
+# ============================================================
+
+create_quarter_snapshot <- function(current_data, adj_log_path, snapshot_dir,
+                                    quarter_label, notes = "", files_loaded = character(),
+                                    notes_log_path = NULL) {
+  
+  if (is.null(current_data) || nrow(current_data) == 0) {
+    stop("No current data to snapshot")
+  }
+  
+  dir.create(snapshot_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  adj_log <- read_adjustments_log(adj_log_path)
+  
+  if (!"notes" %in% names(adj_log)) {
+    adj_log$notes <- ""
+  }
+  
+  quarter_date <- qtr_end_from_mmm_yy(quarter_label)
+  revision_win <- revision_window(quarter_date)
+  
+  issuers <- unique(current_data$issuer_sector)
+  issuers <- issuers[issuers != "000"]
+  
+  all_final_data <- list()
+  
+  for (iss in issuers) {
+    adj_for_issuer <- adj_log %>%
+      filter(issuer_sector == iss)
+    
+    source_df <- current_data %>%
+      filter(issuer_sector == iss) %>%
+      filter(safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtr)) %>%
+      mutate(qtr_end = qtr_end_from_mmm_yy(qtr))
+    
+    if (nrow(source_df) == 0) next
+    
+    if (nrow(adj_for_issuer) > 0) {
+      adj_latest <- adj_for_issuer %>%
+        mutate(asof_ts = suppressWarnings(as.POSIXct(asof, tz = "UTC"))) %>%
+        arrange(inst_class, instrument, counterparty_sector, qtr, desc(asof_ts)) %>%
+        distinct(inst_class, instrument, counterparty_sector, qtr, .keep_all = TRUE)
+      
+      source_df <- source_df %>%
+        left_join(
+          adj_latest %>%
+            select(inst_class, instrument, counterparty_sector, qtr, adj_delta, notes),
+          by = c("inst_class", "instrument", "counterparty_sector", "qtr")
+        ) %>%
+        mutate(
+          in_window = qtr_end >= revision_win$start & qtr_end <= revision_win$end,
+          adj_delta = coalesce(adj_delta, 0),
+          effective_adj = if_else(in_window & counterparty_sector != "000", adj_delta, 0),
+          final_value = value + effective_adj,
+          adj_notes = coalesce(notes, "")
+        )
+    } else {
+      source_df <- source_df %>%
+        mutate(
+          adj_delta = 0,
+          effective_adj = 0,
+          final_value = value,
+          adj_notes = ""
+        )
+    }
+    
+    final_detail <- source_df %>%
+      select(inst_class, instrument, issuer_sector, counterparty_sector,
+             qtr, qtr_end, value, adj_delta, effective_adj, final_value,
+             vintage, adj_notes)
+    
+    all_final_data[[iss]] <- final_detail
+  }
+  
+  timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  snapshot_filename <- paste0("ET27_Snapshot_", quarter_label, "_", timestamp, ".xlsx")
+  snapshot_path <- file.path(snapshot_dir, snapshot_filename)
+  
+  wb <- openxlsx::createWorkbook()
+  
+  if (length(all_final_data) > 0) {
+    final_combined <- bind_rows(all_final_data)
+    openxlsx::addWorksheet(wb, "Final_Data")
+    openxlsx::writeData(wb, "Final_Data", final_combined)
+  }
+  
+  openxlsx::addWorksheet(wb, "Adjustments_Log")
+  openxlsx::writeData(wb, "Adjustments_Log", adj_log)
+  
+  metadata <- data.frame(
+    Quarter = quarter_label,
+    Snapshot_Date = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    Revision_Window_Start = format_mmm_yy(revision_win$start),
+    Revision_Window_End = format_mmm_yy(revision_win$end),
+    Number_of_Issuers = length(issuers),
+    Total_Adjustments = nrow(adj_log),
+    Notes = notes,
+    Source_Files = paste(files_loaded, collapse = "; "),
+    stringsAsFactors = FALSE
+  )
+  openxlsx::addWorksheet(wb, "Metadata")
+  openxlsx::writeData(wb, "Metadata", metadata)
+  
+  summary_list <- list()
+  for (iss in issuers) {
+    if (is.null(all_final_data[[iss]])) next
+    
+    summary_df <- all_final_data[[iss]] %>%
+      group_by(counterparty_sector, qtr) %>%
+      summarise(
+        Source_Value = sum(value, na.rm = TRUE),
+        Total_Adjustments = sum(effective_adj, na.rm = TRUE),
+        Final_Value = sum(final_value, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        Issuer_Sector = iss,
+        Type = if_else(counterparty_sector == "000", "L", "A"),
+        Sector = if_else(counterparty_sector == "000", iss, counterparty_sector)
+      ) %>%
+      select(Issuer_Sector, Type, Sector, Quarter = qtr, Source_Value,
+             Total_Adjustments, Final_Value)
+    
+    summary_list[[iss]] <- summary_df
+  }
+  
+  if (length(summary_list) > 0) {
+    summary_combined <- bind_rows(summary_list)
+    openxlsx::addWorksheet(wb, "Summary_by_Issuer")
+    openxlsx::writeData(wb, "Summary_by_Issuer", summary_combined)
+  }
+  
+  if (!is.null(notes_log_path) && file.exists(notes_log_path)) {
+    notes_log <- tryCatch(read_notes_log(notes_log_path), error = function(e) NULL)
+    if (!is.null(notes_log) && nrow(notes_log) > 0) {
+      openxlsx::addWorksheet(wb, "Notes_Log")
+      openxlsx::writeData(wb, "Notes_Log", notes_log)
+    }
+  }
+  
+  openxlsx::saveWorkbook(wb, snapshot_path, overwrite = TRUE)
+  
+  index_path <- file.path(snapshot_dir, "snapshot_index.csv")
+  if (file.exists(index_path)) {
+    index_df <- read.csv(index_path, stringsAsFactors = FALSE)
+  } else {
+    index_df <- data.frame(
+      Snapshot_File = character(),
+      Quarter = character(),
+      Snapshot_Date = character(),
+      Notes = character(),
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  new_entry <- data.frame(
+    Snapshot_File = snapshot_filename,
+    Quarter = quarter_label,
+    Snapshot_Date = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    Notes = notes,
+    stringsAsFactors = FALSE
+  )
+  
+  index_df <- rbind(index_df, new_entry)
+  write.csv(index_df, index_path, row.names = FALSE)
+  
+  return(list(
+    path = snapshot_path,
+    filename = snapshot_filename,
+    timestamp = timestamp
+  ))
+}
+
+list_snapshots <- function(snapshot_dir) {
+  if (is.null(snapshot_dir) || snapshot_dir == "" || !dir.exists(snapshot_dir)) {
+    return(data.frame(
+      Snapshot_File = character(),
+      Quarter = character(),
+      Snapshot_Date = character(),
+      Notes = character(),
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  index_path <- file.path(snapshot_dir, "snapshot_index.csv")
+  if (!file.exists(index_path)) {
+    return(data.frame(
+      Snapshot_File = character(),
+      Quarter = character(),
+      Snapshot_Date = character(),
+      Notes = character(),
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  tryCatch({
+    read.csv(index_path, stringsAsFactors = FALSE) %>%
+      arrange(desc(Snapshot_Date))
+  }, error = function(e) {
+    data.frame(
+      Snapshot_File = character(),
+      Quarter = character(),
+      Snapshot_Date = character(),
+      Notes = character(),
+      stringsAsFactors = FALSE
+    )
+  })
+}
+
+load_snapshot <- function(snapshot_path) {
+  if (!file.exists(snapshot_path)) {
+    stop("Snapshot file not found")
+  }
+  
+  result <- list()
+  
+  tryCatch({
+    result$final_data <- readxl::read_excel(snapshot_path, sheet = "Final_Data")
+  }, error = function(e) {
+    result$final_data <- NULL
+  })
+  
+  tryCatch({
+    result$adjustments_log <- readxl::read_excel(snapshot_path, sheet = "Adjustments_Log")
+  }, error = function(e) {
+    result$adjustments_log <- NULL
+  })
+  
+  tryCatch({
+    result$metadata <- readxl::read_excel(snapshot_path, sheet = "Metadata")
+  }, error = function(e) {
+    result$metadata <- NULL
+  })
+  
+  tryCatch({
+    result$summary <- readxl::read_excel(snapshot_path, sheet = "Summary_by_Issuer")
+  }, error = function(e) {
+    result$summary <- NULL
+  })
+  
+  if (!is.null(result$final_data) && nrow(result$final_data) > 0) {
+    result$final_data <- result$final_data %>%
+      mutate(
+        inst_class = as.character(inst_class),
+        instrument = as.character(instrument),
+        issuer_sector = sprintf("%03d", as.integer(issuer_sector)),
+        counterparty_sector = sprintf("%03d", as.integer(counterparty_sector)),
+        qtr = as.character(qtr),
+        value = as.numeric(value),
+        adj_delta = as.numeric(adj_delta),
+        effective_adj = as.numeric(effective_adj),
+        final_value = as.numeric(final_value),
+        vintage = as.character(vintage)
+      )
+  }
+  
+  if (!is.null(result$adjustments_log) && nrow(result$adjustments_log) > 0) {
+    result$adjustments_log <- result$adjustments_log %>%
+      mutate(
+        inst_class = as.character(inst_class),
+        instrument = as.character(instrument),
+        issuer_sector = sprintf("%03d", as.integer(issuer_sector)),
+        counterparty_sector = sprintf("%03d", as.integer(counterparty_sector)),
+        qtr = as.character(qtr),
+        adj_delta = as.numeric(adj_delta),
+        asof = as.character(asof)
+      )
+  }
+  
+  result
+}
+
+# ============================================================
+# PART 06B — NOTES MANAGEMENT
+# ============================================================
+
+ensure_notes_file <- function(path) {
+  if (!file.exists(path)) {
+    dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+    write.csv(
+      data.frame(
+        note_type = character(),      # "movement" or "adjustment"
+        issuer_sector = character(),
+        counterparty_sector = character(),
+        qtr = character(),
+        panel = character(),          # "source", "adjustment", "final", "revision"
+        note_text = character(),
+        created_by = character(),
+        created_at = character(),
+        stringsAsFactors = FALSE
+      ),
+      path,
+      row.names = FALSE
+    )
+  }
+}
+
+read_notes_log <- function(path) {
+  ensure_notes_file(path)
+  df <- tryCatch(read.csv(path, stringsAsFactors = FALSE), error = function(e) NULL)
+  
+  if (is.null(df) || nrow(df) == 0) {
+    return(tibble(
+      note_type = character(),
+      issuer_sector = character(),
+      counterparty_sector = character(),
+      qtr = character(),
+      panel = character(),
+      note_text = character(),
+      created_by = character(),
+      created_at = character()
+    ))
+  }
+  
+  if (!"panel" %in% names(df)) {
+    df$panel <- "unknown"
+  }
+  
+  as_tibble(df) %>%
+    mutate(
+      note_type = as.character(note_type),
+      issuer_sector = sprintf("%03d", as.integer(issuer_sector)),
+      counterparty_sector = sprintf("%03d", as.integer(counterparty_sector)),
+      qtr = as.character(qtr),
+      panel = as.character(panel),
+      note_text = as.character(note_text),
+      created_by = as.character(created_by),
+      created_at = as.character(created_at)
+    )
+}
+
+add_note <- function(path, note_type, issuer_sector, counterparty_sector, qtr, panel, note_text, created_by = "") {
+  ensure_notes_file(path)
+  row <- data.frame(
+    note_type = note_type,
+    issuer_sector = issuer_sector,
+    counterparty_sector = counterparty_sector,
+    qtr = qtr,
+    panel = panel,
+    note_text = note_text,
+    created_by = created_by,
+    created_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    stringsAsFactors = FALSE
+  )
+  write.table(row, path, sep = ",", col.names = FALSE, row.names = FALSE, append = TRUE)
+}
+
+get_notes_for_issuer <- function(notes_log, issuer_sector) {
+  if (nrow(notes_log) == 0) return(notes_log)
+  
+  notes_log %>%
+    filter(issuer_sector == !!issuer_sector) %>%
+    arrange(desc(created_at))
+}
+
+get_latest_note <- function(notes_log, issuer_sector, counterparty_sector, qtr, note_type = NULL) {
+  if (nrow(notes_log) == 0) return(NULL)
+  
+  filtered <- notes_log %>%
+    filter(
+      issuer_sector == !!issuer_sector,
+      counterparty_sector == !!counterparty_sector,
+      qtr == !!qtr
+    )
+  
+  if (!is.null(note_type)) {
+    filtered <- filtered %>% filter(note_type == !!note_type)
+  }
+  
+  if (nrow(filtered) == 0) return(NULL)
+  
+  filtered %>%
+    arrange(desc(created_at)) %>%
+    slice(1)
+}
+
+# ============================================================
+# PART 07 — MATRIX BUILDING FUNCTIONS
+# ============================================================
+
+build_wide_matrix <- function(df_long, value_col = "value", row_cols = c("counterparty_sector")) {
+  if (nrow(df_long) == 0) {
+    return(data.frame())
+  }
+  
+  df_long <- df_long %>%
+    filter(safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtr)) %>%
+    mutate(qtr = parse_quarter_label(qtr)) %>%
+    mutate(qtr_end = qtr_end_from_mmm_yy(qtr))
+  
+  if (nrow(df_long) == 0) {
+    return(data.frame())
+  }
+  
+  qtr_order <- df_long %>%
+    distinct(qtr, qtr_end) %>%
+    arrange(qtr_end) %>%
+    pull(qtr)
+  
+  df_long %>%
+    select(all_of(row_cols), qtr, all_of(value_col)) %>%
+    pivot_wider(names_from = qtr, values_from = all_of(value_col),
+                values_fn = sum, values_fill = 0) %>%
+    select(all_of(row_cols), all_of(qtr_order))
+}
+
+build_source_matrix <- function(source_data, target_issuer) {
+  if (is.null(source_data) || nrow(source_data) == 0) {
+    return(data.frame(Type = character(), Sector = character()))
+  }
+  
+  df <- source_data %>%
+    filter(issuer_sector == target_issuer) %>%
+    group_by(counterparty_sector, qtr) %>%
+    summarise(value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+    mutate(
+      Type = if_else(counterparty_sector == "000", "L", "A"),
+      Sector = if_else(counterparty_sector == "000", target_issuer, counterparty_sector)
+    )
+  
+  if (nrow(df) == 0) return(data.frame(Type = character(), Sector = character()))
+  
+  mat <- build_wide_matrix(df, "value", c("Type", "Sector", "counterparty_sector"))
+  if (nrow(mat) == 0) return(data.frame(Type = character(), Sector = character()))
+  
+  mat %>%
+    arrange(Type != "L", Sector) %>%
+    select(-counterparty_sector)
+}
+
+build_residual_row <- function(source_data, target_issuer) {
+  if (is.null(source_data) || nrow(source_data) == 0) {
+    return(data.frame(Type = "Residual", Sector = ""))
+  }
+  
+  df <- source_data %>%
+    filter(issuer_sector == target_issuer) %>%
+    filter(safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtr)) %>%
+    mutate(qtr = parse_quarter_label(qtr)) %>%
+    mutate(qtr_end = qtr_end_from_mmm_yy(qtr))
+  
+  qtr_order <- df %>% distinct(qtr, qtr_end) %>% arrange(qtr_end) %>% pull(qtr)
+  
+  issuance <- df %>%
+    filter(counterparty_sector == "000") %>%
+    group_by(qtr) %>%
+    summarise(issuance = sum(value, na.rm = TRUE), .groups = "drop")
+  
+  holders <- df %>%
+    filter(counterparty_sector != "000") %>%
+    group_by(qtr) %>%
+    summarise(holders = sum(value, na.rm = TRUE), .groups = "drop")
+  
+  residuals <- issuance %>%
+    left_join(holders, by = "qtr") %>%
+    mutate(
+      holders = coalesce(holders, 0),
+      residual = round(issuance - holders, 2)
+    )
+  
+  result <- data.frame(Type = "Residual", Sector = "")
+  for (q in qtr_order) {
+    val <- residuals %>% filter(qtr == q) %>% pull(residual)
+    result[[q]] <- if (length(val) > 0) val else NA
+  }
+  result
+}
+
+build_adj_matrix <- function(adj_long, target_issuer) {
+  if (is.null(adj_long) || nrow(adj_long) == 0) {
+    return(data.frame(Type = character(), Sector = character(),
+                      instrument = character(), counterparty_sector = character()))
+  }
+  
+  if ("issuer_sector" %in% names(adj_long)) {
+    adj_long <- adj_long %>% filter(issuer_sector == target_issuer)
+  }
+  
+  issuance <- adj_long %>%
+    filter(counterparty_sector == "000") %>%
+    group_by(qtr) %>%
+    summarise(adj_delta = sum(adj_delta, na.rm = TRUE), .groups = "drop") %>%
+    mutate(
+      Type = "L",
+      Sector = target_issuer,
+      instrument = "ALL",
+      counterparty_sector = "000"
+    )
+  
+  holders <- adj_long %>%
+    filter(counterparty_sector != "000") %>%
+    mutate(
+      Type = "A",
+      Sector = counterparty_sector
+    )
+  
+  combined <- bind_rows(issuance, holders)
+  
+  if (nrow(combined) == 0) {
+    return(data.frame(Type = character(), Sector = character(),
+                      instrument = character(), counterparty_sector = character()))
+  }
+  
+  mat <- build_wide_matrix(combined, "adj_delta",
+                           c("Type", "Sector", "instrument", "counterparty_sector"))
+  
+  if (nrow(mat) == 0) {
+    return(data.frame(Type = character(), Sector = character(),
+                      instrument = character(), counterparty_sector = character()))
+  }
+  
+  mat %>%
+    arrange(Type != "L", Sector, instrument)
+}
+
+build_final_matrix <- function(source_data, adj_long, target_issuer, revision_win) {
+  if (is.null(source_data) || nrow(source_data) == 0) {
+    return(data.frame(Type = character(), Sector = character()))
+  }
+  
+  source_df <- source_data %>%
+    filter(issuer_sector == target_issuer) %>%
+    filter(safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtr)) %>%
+    mutate(qtr = parse_quarter_label(qtr)) %>%
+    mutate(qtr_end = qtr_end_from_mmm_yy(qtr))
+  
+  if (nrow(source_df) == 0) {
+    return(data.frame(Type = character(), Sector = character()))
+  }
+  
+  if (!is.null(adj_long) && nrow(adj_long) > 0) {
+    adj_for_issuer <- adj_long %>%
+      filter(issuer_sector == target_issuer)
+    
+    source_df <- source_df %>%
+      left_join(adj_for_issuer %>% select(-issuer_sector),
+                by = c("inst_class", "instrument", "counterparty_sector", "qtr")) %>%
+      mutate(
+        in_window = qtr_end >= revision_win$start & qtr_end <= revision_win$end,
+        adj_delta = coalesce(adj_delta, 0),
+        effective_adj = if_else(in_window & counterparty_sector != "000", adj_delta, 0),
+        final_value = value + effective_adj
+      )
+  } else {
+    source_df <- source_df %>% mutate(final_value = value)
+  }
+  
+  final_df <- source_df %>%
+    group_by(counterparty_sector, qtr, qtr_end) %>%
+    summarise(final_value = sum(final_value, na.rm = TRUE), .groups = "drop") %>%
+    mutate(
+      Type = if_else(counterparty_sector == "000", "L", "A"),
+      Sector = if_else(counterparty_sector == "000", target_issuer, counterparty_sector)
+    )
+  
+  mat <- build_wide_matrix(final_df, "final_value", c("Type", "Sector", "counterparty_sector"))
+  if (nrow(mat) == 0) return(data.frame(Type = character(), Sector = character()))
+  
+  mat %>%
+    arrange(Type != "L", Sector) %>%
+    select(-counterparty_sector)
+}
+
+build_revisions_matrix <- function(current_data, old_data, target_issuer) {
+  if (is.null(current_data) || nrow(current_data) == 0 ||
+      is.null(old_data) || nrow(old_data) == 0) {
+    return(data.frame(Type = character(), Sector = character(), Message = "No revision data available"))
+  }
+  
+  cur <- current_data %>%
+    filter(issuer_sector == target_issuer) %>%
+    filter(safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtr)) %>%
+    mutate(qtr = parse_quarter_label(qtr)) %>%
+    group_by(counterparty_sector, qtr) %>%
+    summarise(cur_value = sum(value, na.rm = TRUE), .groups = "drop")
+  
+  old <- old_data %>%
+    filter(issuer_sector == target_issuer) %>%
+    filter(safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtr)) %>%
+    mutate(qtr = parse_quarter_label(qtr)) %>%
+    group_by(counterparty_sector, qtr) %>%
+    summarise(old_value = sum(value, na.rm = TRUE), .groups = "drop")
+  
+  if (nrow(cur) == 0) {
+    return(data.frame(Type = character(), Sector = character(), Message = "No current data for this issuer"))
+  }
+  
+  revisions <- cur %>%
+    full_join(old, by = c("counterparty_sector", "qtr")) %>%
+    mutate(
+      cur_value = coalesce(cur_value, 0),
+      old_value = coalesce(old_value, 0),
+      revision = round(cur_value - old_value, 2),
+      Type = if_else(counterparty_sector == "000", "L", "A"),
+      Sector = if_else(counterparty_sector == "000", target_issuer, counterparty_sector)
+    )
+  
+  mat <- build_wide_matrix(revisions, "revision", c("Type", "Sector", "counterparty_sector"))
+  if (nrow(mat) == 0) return(data.frame(Type = character(), Sector = character()))
+  
+  mat %>%
+    arrange(Type != "L", Sector) %>%
+    select(-counterparty_sector)
+}
+
+add_qoq_columns <- function(wide_matrix) {
+  if (is.null(wide_matrix) || nrow(wide_matrix) == 0) {
+    return(wide_matrix)
+  }
+  
+  all_cols <- names(wide_matrix)
+  qtr_cols <- all_cols[grepl("^[A-Za-z]{3}-\\d{2}$", all_cols)]
+  
+  if (length(qtr_cols) < 2) {
+    wide_matrix$Change <- NA
+    wide_matrix$`% Chg` <- "-"
+    return(wide_matrix)
+  }
+  
+  qtr_dates <- qtr_end_from_mmm_yy(qtr_cols)
+  qtr_order <- qtr_cols[order(qtr_dates)]
+  
+  curr_qtr <- qtr_order[length(qtr_order)]
+  prev_qtr <- qtr_order[length(qtr_order) - 1]
+  
+  curr_vals <- if (curr_qtr %in% names(wide_matrix)) wide_matrix[[curr_qtr]] else NA
+  prev_vals <- if (prev_qtr %in% names(wide_matrix)) wide_matrix[[prev_qtr]] else NA
+  
+  wide_matrix$Change <- round(curr_vals - prev_vals, 0)
+  
+  wide_matrix$`% Chg` <- sapply(seq_len(nrow(wide_matrix)), function(i) {
+    prev_val <- prev_vals[i]
+    curr_val <- curr_vals[i]
+    if (is.na(prev_val) || is.na(curr_val) || prev_val == 0) return("-")
+    pct <- ((curr_val - prev_val) / abs(prev_val)) * 100
+    sprintf("%+.1f%%", pct)
+  })
+  
+  wide_matrix
+}
+
+# ============================================================
+# PART 07 — UI COMPONENTS
+# ============================================================
+
+app_css <- HTML("
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: #f8f9fa;
+  }
+
+  .main-header {
+    background: linear-gradient(135deg, #1a5276 0%, #2980b9 100%);
+    color: white;
+    padding: 20px;
+    margin-bottom: 20px;
+    border-radius: 8px;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+  }
+
+  .main-header h2 { margin: 0; font-weight: 600; }
+  .main-header p { margin: 5px 0 0 0; opacity: 0.9; }
+
+  .sidebar-panel {
+    background: white;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  }
+
+  .panel-header {
+    background: #ecf0f1;
+    padding: 12px 15px;
+    margin: 15px 0 10px 0;
+    border-left: 4px solid #3498db;
+    border-radius: 4px;
+    font-weight: 600;
+    color: #2c3e50;
+  }
+
+  table.dataTable tr.issuance-row td {
+    background-color: #fef9e7 !important;
+    font-weight: 700 !important;
+    border-top: 2px solid #f39c12 !important;
+    border-bottom: 2px solid #f39c12 !important;
+  }
+
+  table.dataTable tr.residual-row td {
+    background-color: #eaf2f8 !important;
+    font-style: italic;
+    border-top: 2px solid #3498db !important;
+  }
+
+  .table-container-fixed { max-width: 1160px; overflow-x: auto; }
+  .table-container-wide { max-width: 1370px; overflow-x: auto; }
+
+  .table-container-fixed .dataTables_wrapper,
+  .table-container-wide .dataTables_wrapper { width: 100%; }
+
+  .table-container-fixed table.dataTable th:nth-child(1),
+  .table-container-fixed table.dataTable td:nth-child(1),
+  .table-container-wide table.dataTable th:nth-child(1),
+  .table-container-wide table.dataTable td:nth-child(1) {
+    width: 50px !important; min-width: 50px !important; max-width: 50px !important;
+  }
+
+  .table-container-fixed table.dataTable th:nth-child(2),
+  .table-container-fixed table.dataTable td:nth-child(2),
+  .table-container-wide table.dataTable th:nth-child(2),
+  .table-container-wide table.dataTable td:nth-child(2) {
+    width: 80px !important; min-width: 80px !important; max-width: 80px !important;
+  }
+
+  .table-container-fixed table.dataTable th:nth-child(n+3),
+  .table-container-fixed table.dataTable td:nth-child(n+3),
+  .table-container-wide table.dataTable th:nth-child(n+3),
+  .table-container-wide table.dataTable td:nth-child(n+3) {
+    width: 70px !important;
+    min-width: 70px !important;
+    text-align: right;
+  }
+
+  .info-box {
+    background: linear-gradient(135deg, #e8f4fd 0%, #d4e9f7 100%);
+    border-left: 4px solid #3498db;
+    padding: 12px 15px;
+    margin: 10px 0;
+    border-radius: 4px;
+  }
+
+  .info-box.warning {
+    background: linear-gradient(135deg, #fef9e7 0%, #fdebd0 100%);
+    border-left-color: #f39c12;
+  }
+
+  .info-box.success {
+    background: linear-gradient(135deg, #e8f8f5 0%, #d5f4e6 100%);
+    border-left-color: #27ae60;
+  }
+
+  .nav-tabs > li > a { color: #2c3e50; font-weight: 500; }
+
+  .nav-tabs > li.active > a {
+    background-color: #3498db !important;
+    color: white !important;
+    border-color: #3498db !important;
+  }
+
+  .btn-primary { background: linear-gradient(135deg, #3498db 0%, #2980b9 100%); border: none; }
+  .btn-primary:hover { background: linear-gradient(135deg, #2980b9 0%, #1a5276 100%); }
+
+  .btn-success { background: linear-gradient(135deg, #27ae60 0%, #229954 100%); border: none; color: white; }
+  .btn-success:hover { background: linear-gradient(135deg, #229954 0%, #1e8449 100%); }
+
+  .btn-warning { background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%); border: none; color: white; }
+  .btn-warning:hover { background: linear-gradient(135deg, #e67e22 0%, #d35400 100%); }
+
+  .dataTables_wrapper { margin-top: 10px; }
+
+  table.dataTable thead th { background: #34495e; color: white; font-weight: 500; }
+  table.dataTable tbody td { text-align: right; }
+
+  table.dataTable tbody td:first-child,
+  table.dataTable tbody td:nth-child(2) {
+    text-align: left;
+    font-weight: 500;
+  }
+
+  .edit-quarter-box {
+    background: linear-gradient(135deg, #27ae60 0%, #2ecc71 100%);
+    color: white;
+    padding: 15px;
+    border-radius: 8px;
+    margin: 15px 0;
+    text-align: center;
+  }
+
+  .edit-quarter-box .label { font-size: 0.9em; opacity: 0.9; }
+  .edit-quarter-box .value { font-size: 1.5em; font-weight: 700; }
+
+  .revision-window-box {
+    background: #ecf0f1;
+    padding: 10px;
+    border-radius: 4px;
+    margin-top: 10px;
+    font-size: 0.85em;
+  }
+")
+
+tab_switch_js <- HTML("
+<script>
+$(document).on('shown.bs.tab', 'a[data-toggle=\"tab\"]', function(e) {
+  setTimeout(function() {
+    $($.fn.dataTable.tables(true)).DataTable().columns.adjust().draw();
+  }, 150);
+});
+Shiny.addCustomMessageHandler('redrawTables', function(message) {
+  setTimeout(function() {
+    $($.fn.dataTable.tables(true)).DataTable().columns.adjust().draw();
+  }, 150);
+});
+$(window).on('resize', function() {
+  $($.fn.dataTable.tables(true)).DataTable().columns.adjust();
+});
+$(document).ready(function() {
+  setTimeout(function() {
+    $($.fn.dataTable.tables(true)).DataTable().columns.adjust().draw();
+  }, 500);
+});
+</script>
+")
+
+paste_js <- JS("
+function(settings) {
+  var table = this.api();
+  var $node = $(table.table().node());
+
+  if ($node.data('pasteBound')) return;
+  $node.data('pasteBound', true);
+
+  $node.on('paste', 'td', function(e) {
+    var cell = table.cell(this);
+    var idx = cell.index();
+    if (!idx) return;
+
+    var text = (e.originalEvent || e).clipboardData.getData('text');
+    if (!text) return;
+
+    Shiny.setInputValue('paste_event', {
+      row: idx.row + 1,
+      col: idx.column + 1,
+      text: text,
+      ts: Date.now()
+    }, {priority: 'event'});
+
+    e.preventDefault();
+  });
+}
+")
+
+issuance_row_callback <- JS("
+function(row, data, index) {
+  if (data && data.length > 0) {
+    if (data[0] && data[0].toString() === 'L') {
+      $(row).addClass('issuance-row');
+    }
+    if (data[0] && data[0].toString() === 'Residual') {
+      $(row).addClass('residual-row');
+    }
+  }
+}
+")
+
+scroll_right_callback <- JS("
+function(settings) {
+  var wrapper = $(this.api().table().container());
+  var scrollBody = wrapper.find('.dataTables_scrollBody');
+  if (scrollBody.length) {
+    setTimeout(function() {
+      scrollBody.scrollLeft(scrollBody[0].scrollWidth);
+    }, 100);
+  }
+}
+")
+
+# (context_menu_js unchanged)
+context_menu_js <- "
+$(document).ready(function() {
+  window.selectedCells = [];
+
+  function isQuarterColumn(colHeader) {
+    var text = $(colHeader).text();
+    return text.match(/^[A-Za-z]{3}-\\d{2}$/);
+  }
+
+  function detectPanel(tableEl) {
+    var shinyOutput = $(tableEl).closest('.shiny-html-output');
+    var outputId = shinyOutput.attr('id') || '';
+    var checkStr = outputId.toLowerCase();
+
+    if (checkStr === 'tbl_source') return 'source';
+    if (checkStr === 'tbl_source_resid') return 'source_resid';
+    if (checkStr === 'tbl_adj') return 'adjustment';
+    if (checkStr === 'tbl_adj_resid') return 'adj_resid';
+    if (checkStr === 'tbl_final') return 'final';
+    if (checkStr === 'tbl_rev') return 'revision';
+
+    if (checkStr.indexOf('source') >= 0 && checkStr.indexOf('resid') < 0) return 'source';
+    if (checkStr.indexOf('adj') >= 0 && checkStr.indexOf('resid') < 0) return 'adjustment';
+    if (checkStr.indexOf('final') >= 0) return 'final';
+    if (checkStr.indexOf('rev') >= 0) return 'revision';
+
+    return 'unknown';
+  }
+
+  function getCellInfo(td) {
+    var tableEl = $(td).closest('table');
+    var table = tableEl.DataTable();
+    var cell = table.cell(td);
+    var idx = cell.index();
+    if (!idx) return null;
+
+    var rowData = table.row(idx.row).data();
+    if (!rowData) return null;
+
+    var colHeader = table.column(idx.column).header();
+    var quarter = $(colHeader).text();
+
+    if (!quarter.match(/^[A-Za-z]{3}-\\d{2}$/)) return null;
+
+    var tableId = tableEl.attr('id') || '';
+    var panelType = detectPanel(tableEl);
+
+    return {
+      row: idx.row,
+      col: idx.column,
+      sector: rowData[1],
+      type: rowData[0],
+      quarter: quarter,
+      panel: panelType,
+      value: cell.data(),
+      tableId: tableId
+    };
+  }
+
+  function clearSelection() {
+    $('.cell-selected').removeClass('cell-selected');
+    window.selectedCells = [];
+  }
+
+  $(document).on('click', function(e) {
+    if (!$(e.target).closest('#note-context-menu').length) {
+      $('#note-context-menu').hide();
+    }
+  });
+
+  setInterval(function() {
+    $('tr.selected').removeClass('selected');
+  }, 50);
+
+  $(document).on('draw.dt', function() {
+    $('.dataTable tbody tr.selected').removeClass('selected');
+  });
+
+  $(document).on('click', '.dataTable tbody td', function(e) {
+    var td = this;
+    var tableEl = $(td).closest('table');
+    var tableId = tableEl.attr('id') || '';
+    var isAdjTable = tableId.indexOf('adj') >= 0 && tableId.indexOf('resid') < 0;
+
+    function clearRowSelection() {
+      $('tr.selected').removeClass('selected');
+      tableEl.find('tr.selected').removeClass('selected');
+    }
+    clearRowSelection();
+    setTimeout(clearRowSelection, 0);
+    setTimeout(clearRowSelection, 10);
+    setTimeout(clearRowSelection, 50);
+    setTimeout(clearRowSelection, 100);
+
+    if (isAdjTable && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+      return true;
+    }
+
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+
+    var cellInfo = getCellInfo(td);
+    if (!cellInfo) {
+      e.preventDefault();
+      return false;
+    }
+
+    if (e.ctrlKey || e.metaKey) {
+      $(td).toggleClass('cell-selected');
+      if ($(td).hasClass('cell-selected')) {
+        window.selectedCells.push(cellInfo);
+      } else {
+        window.selectedCells = window.selectedCells.filter(function(c) {
+          return !(c.row === cellInfo.row && c.col === cellInfo.col && c.tableId === cellInfo.tableId);
+        });
+      }
+    } else {
+      clearSelection();
+      $(td).addClass('cell-selected');
+      window.selectedCells = [cellInfo];
+    }
+
+    e.preventDefault();
+    return false;
+  });
+
+  $(document).on('click', '.dataTable tbody td', function(e) {
+    if (!e.shiftKey) return;
+    if (window.selectedCells.length === 0) return;
+
+    e.stopPropagation();
+    $(this).closest('tr').removeClass('selected');
+
+    var table = $(this).closest('table').DataTable();
+    var lastCell = window.selectedCells[window.selectedCells.length - 1];
+    var cellInfo = getCellInfo(this);
+    if (!cellInfo || lastCell.tableId !== cellInfo.tableId) return;
+
+    var startCol = Math.min(lastCell.col, cellInfo.col);
+    var endCol = Math.max(lastCell.col, cellInfo.col);
+    var row = cellInfo.row;
+
+    var tableEl = $(this).closest('table');
+    for (var c = startCol; c <= endCol; c++) {
+      var colHeader = table.column(c).header();
+      if (isQuarterColumn(colHeader)) {
+        var td = tableEl.find('tbody tr').eq(row).find('td').eq(c);
+        if (!td.hasClass('cell-selected')) {
+          td.addClass('cell-selected');
+          var info = getCellInfo(td[0]);
+          if (info) window.selectedCells.push(info);
+        }
+      }
+    }
+
+    return false;
+  });
+
+  $(document).on('contextmenu', '.dataTable tbody td', function(e) {
+    e.preventDefault();
+
+    var cellInfo = getCellInfo(this);
+    if (!cellInfo) return;
+
+    if (!$(this).hasClass('cell-selected')) {
+      clearSelection();
+      $(this).addClass('cell-selected');
+      window.selectedCells = [cellInfo];
+    }
+
+    var contextData = {
+      cells: window.selectedCells,
+      count: window.selectedCells.length,
+      ts: Date.now()
+    };
+
+    Shiny.setInputValue('note_context', contextData, {priority: 'event'});
+
+    var countText = window.selectedCells.length > 1 ? ' (' + window.selectedCells.length + ' cells)' : '';
+    $('#add-note-menu').html('<i class=\"fa fa-comment\"></i> Add Note' + countText);
+
+    $('#note-context-menu').css({
+      display: 'block',
+      left: e.pageX,
+      top: e.pageY
+    });
+
+    return false;
+  });
+
+  $(document).on('click', '#add-note-menu', function() {
+    $('#note-context-menu').hide();
+    Shiny.setInputValue('show_note_modal', Date.now(), {priority: 'event'});
+  });
+
+  $(document).on('click', '#view-notes-menu', function() {
+    $('#note-context-menu').hide();
+    Shiny.setInputValue('view_cell_notes', Date.now(), {priority: 'event'});
+  });
+
+  var tooltipTimeout;
+  $(document).on('mouseenter', '.dataTable tbody td.has-note', function(e) {
+    var td = this;
+    var cellInfo = getCellInfo(td);
+    if (!cellInfo) return;
+
+    tooltipTimeout = setTimeout(function() {
+      Shiny.setInputValue('hover_cell', {
+        sector: cellInfo.sector,
+        type: cellInfo.type,
+        quarter: cellInfo.quarter,
+        x: e.pageX,
+        y: e.pageY,
+        ts: Date.now()
+      }, {priority: 'event'});
+    }, 300);
+  });
+
+  $(document).on('mouseleave', '.dataTable tbody td.has-note', function() {
+    clearTimeout(tooltipTimeout);
+    $('#note-tooltip').hide();
+  });
+
+  $(document).on('keydown', function(e) {
+    if (e.key === 'Escape') {
+      clearSelection();
+      $('#note-context-menu').hide();
+    }
+  });
+
+  Shiny.addCustomMessageHandler('showNoteTooltip', function(data) {
+    $('#note-tooltip').html(data.html).css({
+      display: 'block',
+      left: data.x + 10,
+      top: data.y + 15
+    });
+  });
+
+  Shiny.addCustomMessageHandler('hideNoteTooltip', function(data) {
+    $('#note-tooltip').hide();
+  });
+
+  Shiny.addCustomMessageHandler('updateNoteCells', function(data) {
+    Shiny.setInputValue('request_note_cells', {issuer: data.issuer, ts: Date.now()}, {priority: 'event'});
+  });
+
+  Shiny.addCustomMessageHandler('markNoteCells', function(data) {
+    $('.dataTable tbody td.has-note').removeClass('has-note');
+
+    if (data.cells && data.cells.length > 0) {
+      data.cells.forEach(function(cell) {
+        $('.shiny-html-output').each(function() {
+          var outputId = $(this).attr('id') || '';
+          var tableEl = $(this).find('.dataTable');
+          if (tableEl.length === 0) return;
+
+          var tablePanel = 'unknown';
+          if (outputId === 'tbl_source') {
+            tablePanel = 'source';
+          } else if (outputId === 'tbl_adj') {
+            tablePanel = 'adjustment';
+          } else if (outputId === 'tbl_final') {
+            tablePanel = 'final';
+          } else if (outputId === 'tbl_rev') {
+            tablePanel = 'revision';
+          } else if (outputId === 'tbl_source_resid') {
+            tablePanel = 'source_resid';
+          } else if (outputId === 'tbl_adj_resid') {
+            tablePanel = 'adj_resid';
+          }
+
+          if (cell.panel && cell.panel !== 'unknown' && tablePanel !== cell.panel) {
+            return;
+          }
+
+          var table = tableEl.DataTable();
+          var rows = table.rows().nodes();
+
+          $(rows).each(function(rowIdx) {
+            var rowData = table.row(rowIdx).data();
+            if (!rowData) return;
+
+            var sector = rowData[1];
+            var type = rowData[0];
+            var cpty = (type === 'L') ? '000' : sector;
+
+            if (cpty === cell.counterparty) {
+              table.columns().every(function(colIdx) {
+                var header = $(this.header()).text();
+                if (header === cell.quarter) {
+                  $(table.cell(rowIdx, colIdx).node()).addClass('has-note');
+                }
+              });
+            }
+          });
+        });
+      });
+    }
+  });
+
+  var adjTooltipTimeout;
+  $(document).on('mouseenter', '#tbl_adj .dataTable tbody td', function(e) {
+    var td = this;
+    var tableEl = $(td).closest('table');
+    var table = tableEl.DataTable();
+    var cell = table.cell(td);
+    var idx = cell.index();
+    if (!idx) return;
+
+    var rowData = table.row(idx.row).data();
+    if (!rowData) return;
+
+    var colHeader = table.column(idx.column).header();
+    var quarter = $(colHeader).text();
+
+    if (!quarter.match(/^[A-Za-z]{3}-\\d{2}$/)) return;
+
+    var sector = rowData[1];
+    var type = rowData[0];
+    var cpty = (type === 'L') ? '000' : sector;
+    var value = cell.data();
+
+    if (cpty === '000') return;
+
+    adjTooltipTimeout = setTimeout(function() {
+      Shiny.setInputValue('adj_cell_hover', {
+        counterparty: cpty,
+        quarter: quarter,
+        current_value: value,
+        x: e.pageX,
+        y: e.pageY,
+        ts: Date.now()
+      }, {priority: 'event'});
+    }, 400);
+  });
+
+  $(document).on('mouseleave', '#tbl_adj .dataTable tbody td', function() {
+    clearTimeout(adjTooltipTimeout);
+    $('#adj-tooltip').hide();
+  });
+
+  Shiny.addCustomMessageHandler('showAdjTooltip', function(data) {
+    $('#adj-tooltip').html(data.html).css({
+      display: 'block',
+      left: data.x + 10,
+      top: data.y + 15
+    });
+  });
+
+  Shiny.addCustomMessageHandler('hideAdjTooltip', function(data) {
+    $('#adj-tooltip').hide();
+  });
+
+  Shiny.addCustomMessageHandler('markChangedCells', function(data) {
+    $('#tbl_adj .dataTable tbody td.has-change').removeClass('has-change');
+
+    if (data.cells && data.cells.length > 0) {
+      var tableEl = $('#tbl_adj .dataTable');
+      if (tableEl.length === 0) return;
+
+      var table = tableEl.DataTable();
+      var rows = table.rows().nodes();
+
+      data.cells.forEach(function(cell) {
+        $(rows).each(function(rowIdx) {
+          var rowData = table.row(rowIdx).data();
+          if (!rowData) return;
+
+          var sector = rowData[1];
+          var type = rowData[0];
+          var cpty = (type === 'L') ? '000' : sector;
+
+          if (cpty === cell.counterparty) {
+            table.columns().every(function(colIdx) {
+              var header = $(this.header()).text();
+              if (header === cell.quarter) {
+                $(table.cell(rowIdx, colIdx).node()).addClass('has-change');
+              }
+            });
+          }
+        });
+      });
+    }
+  });
+});
+"
+
+# ============================================================
+# PART 08 — UI DEFINITION
+# ============================================================
+
+ui <- fluidPage(
+  tags$head(
+    tags$style(app_css),
+    tags$style(HTML("
+      #note-context-menu {
+        display: none;
+        position: absolute;
+        z-index: 10000;
+        background: white;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+        padding: 5px 0;
+        min-width: 180px;
+      }
+      #note-context-menu .menu-item { padding: 8px 15px; cursor: pointer; font-size: 14px; }
+      #note-context-menu .menu-item:hover { background-color: #f0f0f0; }
+      #note-context-menu .menu-item i { margin-right: 8px; width: 16px; }
+
+      .dataTable tbody td.cell-selected {
+        background-color: #d4edda !important;
+        outline: 2px solid #28a745 !important;
+        outline-offset: -2px;
+      }
+
+      .dataTable tbody tr.selected,
+      .dataTable tbody tr.selected:hover,
+      .dataTable tbody tr.odd.selected,
+      .dataTable tbody tr.even.selected,
+      table.dataTable tbody tr.selected,
+      table.dataTable tbody > tr.selected,
+      table.dataTable tbody > tr > .selected {
+        background-color: transparent !important;
+        background: none !important;
+      }
+      .dataTable tbody tr.selected td,
+      .dataTable tbody tr.selected:hover td,
+      table.dataTable tbody tr.selected td {
+        background-color: transparent !important;
+        background: none !important;
+        box-shadow: none !important;
+      }
+      .dataTable tbody td.cell-selected,
+      .dataTable tbody tr.selected td.cell-selected {
+        background-color: #d4edda !important;
+      }
+
+      .dataTable tbody tr.issuance-row td,
+      .dataTable tbody tr.selected.issuance-row td {
+        background-color: #FFF3CD !important;
+      }
+      .dataTable tbody tr.issuance-row td.cell-selected {
+        background-color: #d4edda !important;
+      }
+
+      .dataTable tbody td.has-note {
+        position: relative;
+        cursor: help;
+      }
+      .dataTable tbody td.has-note::after {
+        content: '';
+        position: absolute;
+        top: 2px;
+        right: 2px;
+        width: 0;
+        height: 0;
+        border-left: 8px solid transparent;
+        border-top: 8px solid #3498db;
+      }
+
+      #note-tooltip {
+        display: none;
+        position: absolute;
+        z-index: 10001;
+        background: #2c3e50;
+        color: white;
+        padding: 10px 15px;
+        border-radius: 5px;
+        box-shadow: 0 3px 15px rgba(0,0,0,0.3);
+        max-width: 350px;
+        font-size: 13px;
+        line-height: 1.4;
+      }
+      #note-tooltip::before {
+        content: '';
+        position: absolute;
+        top: -8px;
+        left: 20px;
+        border-left: 8px solid transparent;
+        border-right: 8px solid transparent;
+        border-bottom: 8px solid #2c3e50;
+      }
+      #note-tooltip .tooltip-header { font-weight: bold; margin-bottom: 5px; color: #3498db; }
+      #note-tooltip .tooltip-date { font-size: 11px; color: #95a5a6; margin-top: 5px; }
+
+      #adj-tooltip {
+        display: none;
+        position: absolute;
+        z-index: 10001;
+        background: #1a252f;
+        color: white;
+        padding: 12px 16px;
+        border-radius: 6px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+        min-width: 200px;
+        max-width: 350px;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      #adj-tooltip::before {
+        content: '';
+        position: absolute;
+        top: -8px;
+        left: 20px;
+        border-left: 8px solid transparent;
+        border-right: 8px solid transparent;
+        border-bottom: 8px solid #1a252f;
+      }
+      #adj-tooltip .adj-tooltip-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 3px 0;
+        border-bottom: 1px solid #34495e;
+      }
+      #adj-tooltip .adj-tooltip-row:last-child { border-bottom: none; }
+      #adj-tooltip .adj-tooltip-label { color: #95a5a6; margin-right: 15px; }
+      #adj-tooltip .adj-tooltip-value { font-weight: bold; text-align: right; }
+      #adj-tooltip .adj-tooltip-value.positive { color: #2ecc71; }
+      #adj-tooltip .adj-tooltip-value.negative { color: #e74c3c; }
+      #adj-tooltip .adj-tooltip-notes {
+        margin-top: 8px;
+        padding-top: 8px;
+        border-top: 1px solid #34495e;
+        font-style: italic;
+        color: #bdc3c7;
+      }
+
+      .dataTable tbody td.has-change { position: relative; }
+      .dataTable tbody td.has-change::before {
+        content: '';
+        position: absolute;
+        bottom: 2px;
+        right: 2px;
+        width: 0;
+        height: 0;
+        border-right: 8px solid #f39c12;
+        border-top: 8px solid transparent;
+      }
+    ")),
+    tab_switch_js,
+    tags$script(HTML(context_menu_js))
+  ),
+  
+  div(id = "note-context-menu",
+      div(id = "add-note-menu", class = "menu-item", icon("comment"), "Add Note"),
+      div(id = "view-notes-menu", class = "menu-item", icon("list"), "View Notes")
+  ),
+  div(id = "note-tooltip"),
+  div(id = "adj-tooltip"),
+  
+  div(class = "main-header",
+      h2("ET27 Time Series Review & Adjustments"),
+      p("Liabilities analysis with revision tracking and controlled adjustments")
+  ),
+  
+  sidebarLayout(
+    sidebarPanel(
+      class = "sidebar-panel",
+      width = 3,
+      
+      h4("Data Source", style = "margin-top: 0;"),
+      
+      textInput("folder_path", "Input Folder Path:", value = DEFAULT_INPUT_FOLDER),
+      actionButton("load_folder", "Load from Folder", class = "btn-primary",
+                   style = "width: 100%; margin-bottom: 10px;"),
+      
+      tags$hr(),
+      p("Or upload a single workbook:", style = "font-size: 0.9em; color: #666;"),
+      fileInput("upload_file", NULL, accept = ".xlsx"),
+      
+      uiOutput("load_status"),
+      uiOutput("edit_qtr_display"),
+      
+      tags$hr(),
+      h4("Adjustments & Notes"),
+      downloadButton("download_adj", "Download Adjustments",
+                     style = "width: 100%; margin-bottom: 5px;"),
+      downloadButton("download_notes", "Download Notes",
+                     style = "width: 100%; margin-bottom: 10px;"),
+      fileInput("upload_adj", "Upload Adjustments (CSV)", accept = ".csv"),
+      
+      tags$hr(),
+      h4("Quarter-End Snapshots"),
+      textInput("snapshot_notes", "Snapshot Notes:",
+                placeholder = "e.g., Q3 2025 final review"),
+      actionButton("create_snapshot", "Create Snapshot",
+                   class = "btn-success", style = "width: 100%; margin-bottom: 10px;"),
+      tags$p(class = "text-muted", style = "font-size: 0.8em;",
+             "Saves final data with all adjustments."),
+      
+      h5("Previous Snapshots", style = "margin-top: 15px;"),
+      div(style = "max-height: 200px; overflow-y: auto;",
+          DTOutput("tbl_snapshots", height = "150px")
+      ),
+      actionButton("load_snapshot", "Load Selected Snapshot",
+                   class = "btn-primary btn-sm", style = "width: 100%; margin-top: 5px;"),
+      
+      conditionalPanel(
+        condition = "output.viewing_snapshot == true",
+        div(class = "info-box warning", style = "margin-top: 10px;",
+            tags$strong("Viewing Snapshot"),
+            tags$br(),
+            textOutput("snapshot_view_info", inline = TRUE),
+            tags$br(),
+            actionButton("exit_snapshot_view", "Return to Current Data",
+                         class = "btn-warning btn-sm", style = "margin-top: 5px;")
+        )
+      ),
+      
+      tags$hr(),
+      div(class = "info-box",
+          tags$strong("About Adjustments:"),
+          tags$ul(style = "margin: 5px 0; padding-left: 20px; font-size: 0.85em;",
+                  tags$li("Delta values (not absolute)"),
+                  tags$li("Applied within revision window only"),
+                  tags$li("Issuance rows are read-only"),
+                  tags$li("Last value wins per cell")
+          )
+      )
+    ),
+    
+    mainPanel(
+      width = 9,
+      
+      conditionalPanel(
+        condition = "output.viewing_snapshot == true",
+        div(class = "alert alert-warning",
+            style = "padding: 15px; margin-bottom: 15px; border-left: 5px solid #f39c12; background-color: #fef9e7;",
+            tags$strong(icon("eye"), " SNAPSHOT VIEW MODE"),
+            tags$br(),
+            tags$span("You are viewing historical snapshot data. "),
+            uiOutput("snapshot_banner_info", inline = TRUE),
+            tags$br(),
+            tags$span("Tables below show data from the snapshot, not current values. Editing is disabled.",
+                      style = "font-size: 0.9em; color: #666;")
+        )
+      ),
+      
+      fluidRow(
+        column(4,
+               selectInput("selected_issuer", "Select Issuer Sector:",
+                           choices = NULL, selected = NULL)
+        ),
+        column(8,
+               div(id = "issuer_info", class = "info-box", style = "margin-top: 25px;",
+                   textOutput("issuer_status"))
+        )
+      ),
+      
+      div(class = "panel-header", "Source (Current Levels)"),
+      div(class = "table-container-wide", DTOutput("tbl_source")),
+      div(class = "panel-header", "Source Residual"),
+      div(class = "table-container-fixed", DTOutput("tbl_source_resid")),
+      
+      div(class = "panel-header", "Adjustments (Delta Values)"),
+      div(class = "info-box warning", style = "font-size: 0.85em;",
+          "Edit cells to apply delta adjustments. Issuance rows (L) are read-only.",
+          " Paste from clipboard is supported."
+      ),
+      div(class = "table-container-fixed", DTOutput("tbl_adj")),
+      div(class = "panel-header", "Adjustment Residual"),
+      div(class = "table-container-fixed", DTOutput("tbl_adj_resid")),
+      
+      div(class = "panel-header", "Final (Source + Adjustments)"),
+      div(class = "table-container-wide", DTOutput("tbl_final")),
+      
+      div(class = "panel-header", "Revisions (Current − Old)"),
+      div(class = "table-container-fixed", DTOutput("tbl_rev")),
+      
+      div(class = "panel-header", "Notes & Comments"),
+      div(class = "info-box", style = "font-size: 0.85em; margin-bottom: 10px;",
+          icon("info-circle"), " Right-click on any quarter cell in the tables above to add a note."
+      ),
+      DTOutput("tbl_notes")
+    )
+  )
+)
+
+# ============================================================
+# PART 09 — SERVER LOGIC
+# ============================================================
+
+server <- function(input, output, session) {
+  
+  rv <- reactiveValues(
+    current_data = NULL,
+    old_data = NULL,
+    files_loaded = character(),
+    log_path = DEFAULT_LOG_PATH,
+    notes_path = NULL,
+    adj_state = list(),
+    adj_baseline = list(),
+    snapshot_dir = NULL,
+    viewing_snapshot = FALSE,
+    snapshot_data = NULL,
+    snapshot_metadata = NULL,
+    notes_refresh = NULL
+  )
+  
+  # -------------------------
+  # Data Loading
+  # -------------------------
+  
+  observeEvent(input$load_folder, {
+    req(input$folder_path)
+    
+    if (!dir.exists(input$folder_path)) {
+      showNotification("Folder does not exist!", type = "error")
+      return()
+    }
+    
+    showNotification("Loading workbooks...", type = "message", duration = NULL, id = "loading")
+    
+    tryCatch({
+      data <- load_all_workbooks(input$folder_path)
+      
+      rv$current_data <- data$current
+      rv$old_data <- data$old
+      
+      rv$files_loaded <- data$files
+      rv$log_path <- file.path(input$folder_path, "adjustments_log.csv")
+      rv$notes_path <- file.path(input$folder_path, "notes_log.csv")
+      rv$snapshot_dir <- file.path(input$folder_path, "snapshots")
+      
+      rv$viewing_snapshot <- FALSE
+      rv$snapshot_data <- NULL
+      rv$snapshot_metadata <- NULL
+      
+      removeNotification(id = "loading")
+      showNotification(paste("Loaded", length(data$files), "file(s)"), type = "message")
+      
+      rebuild_adj_state()
+      
+    }, error = function(e) {
+      removeNotification(id = "loading")
+      showNotification(paste("Error:", e$message), type = "error")
+    })
+  })
+  
+  observeEvent(input$upload_file, {
+    req(input$upload_file)
+    
+    showNotification("Loading workbook...", type = "message", duration = NULL, id = "loading")
+    
+    tryCatch({
+      data <- load_workbook(input$upload_file$datapath)
+      
+      rv$current_data <- data$current
+      rv$old_data <- data$old
+      
+      rv$files_loaded <- input$upload_file$name
+      rv$snapshot_dir <- file.path(dirname(rv$log_path), "snapshots")
+      rv$notes_path <- file.path(dirname(rv$log_path), "notes_log.csv")
+      
+      rv$viewing_snapshot <- FALSE
+      rv$snapshot_data <- NULL
+      rv$snapshot_metadata <- NULL
+      
+      removeNotification(id = "loading")
+      showNotification("Workbook loaded successfully!", type = "message")
+      
+      rebuild_adj_state()
+      
+    }, error = function(e) {
+      removeNotification(id = "loading")
+      showNotification(paste("Error:", e$message), type = "error")
+    })
+  })
+  
+  # -------------------------
+  # Derived Data
+  # -------------------------
+  
+  current_levels <- reactive({ rv$current_data })
+  old_levels <- reactive({ rv$old_data })
+  
+  issuers <- reactive({
+    req(current_levels())
+    sort(setdiff(unique(current_levels()$issuer_sector), "000"))
+  })
+  
+  edit_qtr <- reactive({
+    req(current_levels())
+    qtrs <- unique(current_levels()$qtr)
+    valid_qtrs <- qtrs[safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtrs)]
+    valid_qtrs <- parse_quarter_label(valid_qtrs)
+    
+    if (length(valid_qtrs) == 0) return(NULL)
+    
+    qtr_dates <- qtr_end_from_mmm_yy(valid_qtrs)
+    valid_qtrs[which.max(qtr_dates)]
+  })
+  
+  revision_win <- reactive({
+    req(edit_qtr())
+    edit_end <- qtr_end_from_mmm_yy(edit_qtr())
+    revision_window(edit_end)
+  })
+  
+  # -------------------------
+  # Adjustments State Management
+  # -------------------------
+  
+  rebuild_adj_state <- function() {
+    req(current_levels(), issuers(), edit_qtr())
+    
+    w <- revision_win()
+    
+    adj_latest <- latest_adjustments(read_adjustments_log(rv$log_path))
+    
+    for (iss in issuers()) {
+      src <- current_levels() %>%
+        filter(issuer_sector == iss) %>%
+        filter(safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtr)) %>%
+        mutate(qtr = parse_quarter_label(qtr)) %>%
+        mutate(qtr_end = qtr_end_from_mmm_yy(qtr)) %>%
+        filter(qtr_end >= w$start, qtr_end <= w$end)
+      
+      if (nrow(src) == 0) {
+        rv$adj_state[[iss]] <- tibble(
+          inst_class = character(), instrument = character(),
+          issuer_sector = character(), counterparty_sector = character(),
+          qtr = character(), adj_delta = double()
+        )
+        rv$adj_baseline[[iss]] <- tibble(
+          inst_class = character(), instrument = character(),
+          issuer_sector = character(), counterparty_sector = character(),
+          qtr = character(), baseline = double()
+        )
+        next
+      }
+      
+      scope <- src %>%
+        select(inst_class, instrument, issuer_sector, counterparty_sector, qtr) %>%
+        distinct()
+      
+      grid_long <- scope %>%
+        left_join(
+          adj_latest %>% filter(issuer_sector == iss),
+          by = c("inst_class", "instrument", "issuer_sector", "counterparty_sector", "qtr")
+        ) %>%
+        mutate(
+          adj_delta = if_else(counterparty_sector == "000", 0, coalesce(adj_delta, 0))
+        )
+      
+      rv$adj_state[[iss]] <- grid_long
+      
+      baseline_long <- grid_long %>%
+        select(inst_class, instrument, issuer_sector, counterparty_sector, qtr, adj_delta) %>%
+        rename(baseline = adj_delta)
+      
+      rv$adj_baseline[[iss]] <- baseline_long
+    }
+  }
+  
+  observeEvent(rv$files_loaded, {
+    req(current_levels(), issuers(), edit_qtr())
+    rebuild_adj_state()
+  }, ignoreInit = FALSE, ignoreNULL = FALSE, priority = 100)
+  
+  observeEvent(input$upload_adj, {
+    req(input$upload_adj$datapath)
+    file.copy(input$upload_adj$datapath, rv$log_path, overwrite = TRUE)
+    rebuild_adj_state()
+    showNotification("Adjustments loaded", type = "message")
+  })
+  
+  # -------------------------
+  # Snapshot Management
+  # -------------------------
+  
+  observeEvent(input$create_snapshot, {
+    req(current_levels(), edit_qtr())
+    
+    if (is.null(rv$snapshot_dir) || rv$snapshot_dir == "") {
+      rv$snapshot_dir <- file.path(dirname(rv$log_path), "snapshots")
+    }
+    
+    showNotification("Creating snapshot...", type = "message", duration = NULL, id = "snapshot")
+    
+    tryCatch({
+      snapshot_info <- create_quarter_snapshot(
+        current_data = current_levels(),
+        adj_log_path = rv$log_path,
+        snapshot_dir = rv$snapshot_dir,
+        quarter_label = edit_qtr(),
+        notes = input$snapshot_notes,
+        files_loaded = rv$files_loaded,
+        notes_log_path = rv$notes_path
+      )
+      
+      removeNotification(id = "snapshot")
+      showNotification(
+        paste("Snapshot created:", snapshot_info$filename),
+        type = "message",
+        duration = 5
+      )
+      
+      updateTextInput(session, "snapshot_notes", value = "")
+      
+    }, error = function(e) {
+      removeNotification(id = "snapshot")
+      showNotification(paste("Error creating snapshot:", e$message), type = "error")
+    })
+  })
+  
+  output$tbl_snapshots <- renderDT({
+    rv$snapshot_dir
+    snapshots <- list_snapshots(rv$snapshot_dir)
+    
+    if (nrow(snapshots) == 0) {
+      return(datatable(
+        data.frame(Message = "No snapshots yet"),
+        options = list(dom = "t", paging = FALSE),
+        rownames = FALSE,
+        selection = "none"
+      ))
+    }
+    
+    display_df <- snapshots %>%
+      select(Quarter, Date = Snapshot_Date, Notes) %>%
+      mutate(Date = substr(Date, 1, 10))
+    
+    datatable(
+      display_df,
+      options = list(
+        scrollX = TRUE,
+        paging = FALSE,
+        dom = "t",
+        columnDefs = list(list(className = "dt-left", targets = "_all"))
+      ),
+      rownames = FALSE,
+      selection = "single"
+    )
+  })
+  
+  observeEvent(input$load_snapshot, {
+    selected_row <- input$tbl_snapshots_rows_selected
+    
+    if (is.null(selected_row) || length(selected_row) == 0) {
+      showNotification("Please select a snapshot first", type = "warning")
+      return()
+    }
+    
+    snapshots <- list_snapshots(rv$snapshot_dir)
+    if (nrow(snapshots) == 0 || selected_row > nrow(snapshots)) {
+      showNotification("Invalid selection", type = "error")
+      return()
+    }
+    
+    snapshot_file <- snapshots$Snapshot_File[selected_row]
+    snapshot_path <- file.path(rv$snapshot_dir, snapshot_file)
+    
+    showNotification("Loading snapshot...", type = "message", duration = NULL, id = "load_snap")
+    
+    tryCatch({
+      snapshot_data <- load_snapshot(snapshot_path)
+      rv$snapshot_data <- snapshot_data
+      rv$snapshot_metadata <- snapshot_data$metadata
+      rv$viewing_snapshot <- TRUE
+      
+      removeNotification(id = "load_snap")
+      showNotification(
+        paste("Viewing snapshot:", snapshot_file),
+        type = "message",
+        duration = 3
+      )
+      
+    }, error = function(e) {
+      removeNotification(id = "load_snap")
+      showNotification(paste("Error loading snapshot:", e$message), type = "error")
+    })
+  })
+  
+  observeEvent(input$exit_snapshot_view, {
+    rv$viewing_snapshot <- FALSE
+    rv$snapshot_data <- NULL
+    rv$snapshot_metadata <- NULL
+    showNotification("Returned to current data", type = "message", duration = 2)
+  })
+  
+  output$viewing_snapshot <- reactive({ rv$viewing_snapshot })
+  outputOptions(output, "viewing_snapshot", suspendWhenHidden = FALSE)
+  
+  output$snapshot_view_info <- renderText({
+    req(rv$snapshot_metadata)
+    meta <- rv$snapshot_metadata
+    paste(meta$Quarter, "|", substr(meta$Snapshot_Date, 1, 10))
+  })
+  
+  output$snapshot_banner_info <- renderUI({
+    req(rv$snapshot_metadata)
+    meta <- rv$snapshot_metadata
+    tags$span(
+      tags$strong("Quarter: "), meta$Quarter, " | ",
+      tags$strong("Snapshot Date: "), substr(meta$Snapshot_Date, 1, 10), " | ",
+      tags$strong("Notes: "), if (meta$Notes != "") meta$Notes else "(none)"
+    )
+  })
+  
+  # -------------------------
+  # Notes Management
+  # -------------------------
+  
+  rv_note_context <- reactiveVal(NULL)
+  
+  observeEvent(input$note_context, {
+    rv_note_context(input$note_context)
+  })
+  
+  observeEvent(input$show_note_modal, {
+    ctx <- rv_note_context()
+    if (is.null(ctx) || is.null(ctx$cells) || length(ctx$cells) == 0) return()
+    
+    iss <- selected_iss()
+    if (is.null(iss) || iss == "") return()
+    
+    cells <- ctx$cells
+    n_cells <- length(cells)
+    
+    first_cell <- cells[[1]]
+    default_type <- if (first_cell$panel %in% c("adjustment", "adj_resid")) "adjustment" else "movement"
+    
+    if (n_cells == 1) {
+      selection_info <- tags$p(
+        tags$strong("Panel: "), first_cell$panel, tags$br(),
+        tags$strong("Series: "), first_cell$sector, tags$br(),
+        tags$strong("Quarter: "), first_cell$quarter, tags$br(),
+        tags$strong("Value: "), format(as.numeric(first_cell$value), big.mark = ",")
+      )
+      title_text <- paste("Add Note -", first_cell$sector, "/", first_cell$quarter)
+    } else {
+      sectors <- unique(sapply(cells, function(c) c$sector))
+      quarters <- unique(sapply(cells, function(c) c$quarter))
+      
+      selection_info <- tags$div(
+        tags$p(tags$strong("Selected: "), n_cells, " cells"),
+        tags$p(
+          tags$strong("Sectors: "), paste(sectors, collapse = ", "), tags$br(),
+          tags$strong("Quarters: "), paste(quarters, collapse = ", ")
+        ),
+        tags$p(class = "text-muted", style = "font-size: 0.9em;",
+               "Note will be applied to all selected cells.")
+      )
+      title_text <- paste("Add Note -", n_cells, "cells selected")
+    }
+    
+    showModal(modalDialog(
+      title = title_text,
+      selection_info,
+      
+      selectInput("modal_note_type", "Note Type:",
+                  choices = c("Movement Comment" = "movement",
+                              "Adjustment Reason" = "adjustment"),
+                  selected = default_type),
+      
+      textAreaInput("modal_note_text", "Note:", rows = 4,
+                    placeholder = "Enter your note here..."),
+      
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("save_modal_note", "Save Note", class = "btn-primary")
+      ),
+      easyClose = TRUE
+    ))
+  })
+  
+  observeEvent(input$save_modal_note, {
+    ctx <- rv_note_context()
+    req(ctx, ctx$cells, input$modal_note_text)
+    req(nchar(trimws(input$modal_note_text)) > 0)
+    
+    iss <- selected_iss()
+    if (is.null(iss) || iss == "") {
+      showNotification("No issuer selected", type = "error")
+      removeModal()
+      return()
+    }
+    
+    if (is.null(rv$notes_path) || rv$notes_path == "") {
+      rv$notes_path <- file.path(dirname(rv$log_path), "notes_log.csv")
+    }
+    
+    cells <- ctx$cells
+    notes_added <- 0
+    
+    tryCatch({
+      for (cell in cells) {
+        cpty <- if (cell$type == "L") "000" else cell$sector
+        panel <- if (!is.null(cell$panel)) cell$panel else "unknown"
+        
+        add_note(
+          path = rv$notes_path,
+          note_type = input$modal_note_type,
+          issuer_sector = iss,
+          counterparty_sector = cpty,
+          qtr = cell$quarter,
+          panel = panel,
+          note_text = input$modal_note_text,
+          created_by = Sys.info()["user"]
+        )
+        notes_added <- notes_added + 1
+      }
+      
+      removeModal()
+      
+      if (notes_added == 1) {
+        showNotification("Note added successfully", type = "message", duration = 2)
+      } else {
+        showNotification(paste("Note added to", notes_added, "cells"), type = "message", duration = 2)
+      }
+      
+      rv$notes_refresh <- Sys.time()
+      session$sendCustomMessage("updateNoteCells", list(issuer = iss))
+      
+    }, error = function(e) {
+      showNotification(paste("Error adding note:", e$message), type = "error")
+    })
+  })
+  
+  observeEvent(input$view_cell_notes, {
+    ctx <- rv_note_context()
+    if (is.null(ctx) || is.null(ctx$cells) || length(ctx$cells) == 0) return()
+    
+    iss <- selected_iss()
+    if (is.null(iss) || iss == "") return()
+    
+    if (is.null(rv$notes_path) || rv$notes_path == "") {
+      showNotification("No notes file", type = "warning")
+      return()
+    }
+    
+    cells <- ctx$cells
+    notes_log <- tryCatch(read_notes_log(rv$notes_path), error = function(e) tibble())
+    
+    all_cell_notes <- list()
+    for (cell in cells) {
+      cpty <- if (cell$type == "L") "000" else cell$sector
+      
+      cell_notes <- notes_log %>%
+        filter(
+          issuer_sector == iss,
+          counterparty_sector == cpty,
+          qtr == cell$quarter
+        ) %>%
+        mutate(display_sector = cell$sector, display_quarter = cell$quarter)
+      
+      if (nrow(cell_notes) > 0) all_cell_notes[[length(all_cell_notes) + 1]] <- cell_notes
+    }
+    
+    if (length(all_cell_notes) == 0) {
+      title_text <- if (length(cells) == 1) {
+        paste("Notes -", cells[[1]]$sector, "/", cells[[1]]$quarter)
+      } else {
+        paste("Notes -", length(cells), "cells")
+      }
+      
+      showModal(modalDialog(
+        title = title_text,
+        tags$p("No notes for the selected cell(s) yet."),
+        tags$p("Right-click and select 'Add Note' to create one."),
+        footer = modalButton("Close"),
+        easyClose = TRUE
+      ))
+    } else {
+      combined_notes <- bind_rows(all_cell_notes) %>%
+        arrange(desc(created_at))
+      
+      notes_html <- paste(
+        sapply(seq_len(nrow(combined_notes)), function(i) {
+          n <- combined_notes[i, ]
+          paste0(
+            "<div style='border-bottom: 1px solid #eee; padding: 10px 0;'>",
+            "<div style='color: #3498db; font-weight: bold;'>", n$display_sector, " / ", n$display_quarter, "</div>",
+            "<strong>", ifelse(n$note_type == "movement", "Movement", "Adjustment"), "</strong>",
+            " - <span style='color: #666; font-size: 0.9em;'>", n$created_at, "</span>",
+            "<br/>", htmltools::htmlEscape(n$note_text),
+            "</div>"
+          )
+        }),
+        collapse = ""
+      )
+      
+      title_text <- if (length(cells) == 1) {
+        paste("Notes -", cells[[1]]$sector, "/", cells[[1]]$quarter)
+      } else {
+        paste("Notes -", length(cells), "cells (", nrow(combined_notes), "notes)")
+      }
+      
+      showModal(modalDialog(
+        title = title_text,
+        HTML(notes_html),
+        footer = modalButton("Close"),
+        size = "m",
+        easyClose = TRUE
+      ))
+    }
+  })
+  
+  observeEvent(input$hover_cell, {
+    hover <- input$hover_cell
+    if (is.null(hover)) return()
+    
+    iss <- selected_iss()
+    if (is.null(iss) || is.null(rv$notes_path)) return()
+    
+    cpty <- if (hover$type == "L") "000" else hover$sector
+    
+    notes_log <- tryCatch(read_notes_log(rv$notes_path), error = function(e) tibble())
+    
+    cell_notes <- notes_log %>%
+      filter(
+        issuer_sector == iss,
+        counterparty_sector == cpty,
+        qtr == hover$quarter
+      ) %>%
+      arrange(desc(created_at)) %>%
+      head(3)
+    
+    if (nrow(cell_notes) > 0) {
+      tooltip_html <- paste(
+        sapply(seq_len(nrow(cell_notes)), function(i) {
+          n <- cell_notes[i, ]
+          paste0(
+            "<div class='tooltip-header'>",
+            ifelse(n$note_type == "movement", "Movement", "Adjustment"),
+            "</div>",
+            htmltools::htmlEscape(n$note_text),
+            "<div class='tooltip-date'>", n$created_at, "</div>",
+            if (i < nrow(cell_notes)) "<hr style='margin: 8px 0; border-color: #555;'/>" else ""
+          )
+        }),
+        collapse = ""
+      )
+      
+      session$sendCustomMessage("showNoteTooltip", list(
+        html = tooltip_html,
+        x = hover$x,
+        y = hover$y
+      ))
+    }
+  })
+  
+  observeEvent(input$request_note_cells, {
+    req(input$request_note_cells)
+    mark_cells_with_notes()
+  })
+  
+  mark_cells_with_notes <- function() {
+    iss <- selected_iss()
+    if (is.null(iss) || is.null(rv$notes_path)) return()
+    
+    notes_log <- tryCatch(read_notes_log(rv$notes_path), error = function(e) tibble())
+    
+    if (nrow(notes_log) == 0) {
+      session$sendCustomMessage("markNoteCells", list(cells = list()))
+      return()
+    }
+    
+    cells_with_notes <- notes_log %>%
+      filter(issuer_sector == iss) %>%
+      distinct(counterparty_sector, qtr, panel) %>%
+      mutate(
+        counterparty = counterparty_sector,
+        quarter = qtr
+      )
+    
+    cells_list <- lapply(seq_len(nrow(cells_with_notes)), function(i) {
+      list(
+        counterparty = cells_with_notes$counterparty[i],
+        quarter = cells_with_notes$quarter[i],
+        panel = cells_with_notes$panel[i]
+      )
+    })
+    
+    session$sendCustomMessage("markNoteCells", list(cells = cells_list))
+  }
+  
+  # -------------------------
+  # Adjustment Tooltip + Changed Cells
+  # -------------------------
+  
+  observeEvent(input$adj_cell_hover, {
+    req(input$adj_cell_hover)
+    
+    hover <- input$adj_cell_hover
+    iss <- selected_iss()
+    
+    if (is.null(iss) || iss == "") {
+      session$sendCustomMessage("hideAdjTooltip", list())
+      return()
+    }
+    
+    cpty <- hover$counterparty
+    qtr <- hover$quarter
+    current_val <- as.numeric(hover$current_value)
+    if (is.na(current_val)) current_val <- 0
+    
+    baseline_val <- 0
+    if (!is.null(rv$adj_baseline[[iss]]) && nrow(rv$adj_baseline[[iss]]) > 0) {
+      baseline_row <- rv$adj_baseline[[iss]] %>%
+        filter(counterparty_sector == cpty, qtr == !!qtr)
+      if (nrow(baseline_row) > 0) baseline_val <- sum(baseline_row$baseline, na.rm = TRUE)
+    }
+    
+    delta <- current_val - baseline_val
+    
+    notes_text <- ""
+    if (!is.null(rv$notes_path) && file.exists(rv$notes_path)) {
+      notes_log <- tryCatch(read_notes_log(rv$notes_path), error = function(e) tibble())
+      if (nrow(notes_log) > 0) {
+        cell_notes <- notes_log %>%
+          filter(issuer_sector == iss,
+                 counterparty_sector == cpty,
+                 qtr == !!qtr,
+                 panel == "adjustment") %>%
+          arrange(desc(created_at))
+        if (nrow(cell_notes) > 0) notes_text <- cell_notes$note_text[1]
+      }
+    }
+    
+    fmt_baseline <- format(baseline_val, big.mark = ",", nsmall = 0)
+    fmt_current <- format(current_val, big.mark = ",", nsmall = 0)
+    fmt_delta <- paste0(ifelse(delta >= 0, "+", ""), format(delta, big.mark = ",", nsmall = 0))
+    delta_class <- if (delta > 0) "positive" else if (delta < 0) "negative" else ""
+    
+    tooltip_html <- paste0(
+      '<div class="adj-tooltip-row">',
+      '<span class="adj-tooltip-label">Original (baseline):</span>',
+      '<span class="adj-tooltip-value">', fmt_baseline, '</span>',
+      '</div>',
+      '<div class="adj-tooltip-row">',
+      '<span class="adj-tooltip-label">Current:</span>',
+      '<span class="adj-tooltip-value">', fmt_current, '</span>',
+      '</div>',
+      '<div class="adj-tooltip-row">',
+      '<span class="adj-tooltip-label">Change this quarter:</span>',
+      '<span class="adj-tooltip-value ', delta_class, '">', fmt_delta, '</span>',
+      '</div>'
+    )
+    
+    if (nchar(notes_text) > 0) {
+      tooltip_html <- paste0(
+        tooltip_html,
+        '<div class="adj-tooltip-notes">',
+        '<strong>Notes:</strong> ', htmltools::htmlEscape(notes_text),
+        '</div>'
+      )
+    }
+    
+    session$sendCustomMessage("showAdjTooltip", list(
+      html = tooltip_html,
+      x = hover$x,
+      y = hover$y
+    ))
+  })
+  
+  mark_changed_cells <- function() {
+    iss <- selected_iss()
+    if (is.null(iss)) return()
+    
+    adj_state <- rv$adj_state[[iss]]
+    adj_baseline <- rv$adj_baseline[[iss]]
+    
+    if (is.null(adj_state) || is.null(adj_baseline) ||
+        nrow(adj_state) == 0 || nrow(adj_baseline) == 0) {
+      session$sendCustomMessage("markChangedCells", list(cells = list()))
+      return()
+    }
+    
+    comparison <- adj_state %>%
+      select(counterparty_sector, qtr, adj_delta) %>%
+      left_join(adj_baseline %>% select(counterparty_sector, qtr, baseline),
+                by = c("counterparty_sector", "qtr")) %>%
+      mutate(
+        baseline = coalesce(baseline, 0),
+        adj_delta = coalesce(adj_delta, 0)
+      ) %>%
+      filter(adj_delta != baseline, counterparty_sector != "000") %>%
+      distinct(counterparty_sector, qtr)
+    
+    if (nrow(comparison) == 0) {
+      session$sendCustomMessage("markChangedCells", list(cells = list()))
+      return()
+    }
+    
+    cells_list <- lapply(seq_len(nrow(comparison)), function(i) {
+      list(counterparty = comparison$counterparty_sector[i], quarter = comparison$qtr[i])
+    })
+    
+    session$sendCustomMessage("markChangedCells", list(cells = cells_list))
+  }
+  
+  observe({
+    iss <- selected_iss()
+    rv$notes_refresh
+    if (!is.null(iss) && iss != "") {
+      invalidateLater(500)
+      isolate(mark_cells_with_notes())
+      isolate(mark_changed_cells())
+    }
+  })
+  
+  # -------------------------
+  # Notes Table
+  # -------------------------
+  
+  output$tbl_notes <- renderDT({
+    rv$notes_refresh
+    iss <- selected_iss()
+    
+    if (is.null(iss) || iss == "") {
+      return(datatable(data.frame(Message = "Select an issuer to view notes"),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    if (is.null(rv$notes_path) || rv$notes_path == "") {
+      return(datatable(data.frame(Message = "No notes file"),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    notes_log <- tryCatch(read_notes_log(rv$notes_path), error = function(e) tibble())
+    
+    if (nrow(notes_log) == 0) {
+      return(datatable(data.frame(Message = "No notes yet"),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    notes_for_issuer <- notes_log %>%
+      filter(issuer_sector == iss) %>%
+      arrange(desc(created_at)) %>%
+      mutate(
+        Type = if_else(note_type == "movement", "Movement", "Adjustment"),
+        Sector = if_else(counterparty_sector == "000", paste0(iss, " (L)"), counterparty_sector),
+        Quarter = qtr,
+        Note = note_text,
+        `Date/Time` = substr(created_at, 1, 16)
+      ) %>%
+      select(Type, Sector, Quarter, Note, `Date/Time`)
+    
+    if (nrow(notes_for_issuer) == 0) {
+      return(datatable(data.frame(Message = "No notes for this issuer"),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    datatable(notes_for_issuer,
+              options = list(
+                scrollX = TRUE,
+                paging = TRUE,
+                pageLength = 10,
+                dom = "ltip",
+                columnDefs = list(
+                  list(className = "dt-left", targets = c(0, 1, 2, 3)),
+                  list(className = "dt-center", targets = 4),
+                  list(width = "40%", targets = 3)
+                )
+              ),
+              rownames = FALSE,
+              escape = FALSE
+    )
+  })
+  
+  # -------------------------
+  # UI Outputs
+  # -------------------------
+  
+  output$load_status <- renderUI({
+    if (is.null(rv$current_data)) {
+      div(class = "info-box warning",
+          "No data loaded. Enter folder path and click 'Load from Folder' or upload a file.")
+    } else {
+      div(class = "info-box success",
+          tags$strong("Data loaded:"),
+          tags$br(),
+          paste(rv$files_loaded, collapse = ", "),
+          tags$br(),
+          paste(nrow(rv$current_data), "observations")
+      )
+    }
+  })
+  
+  output$edit_qtr_display <- renderUI({
+    qtr <- edit_qtr()
+    w <- tryCatch(revision_win(), error = function(e) NULL)
+    if (is.null(qtr)) return(NULL)
+    
+    tagList(
+      div(class = "edit-quarter-box",
+          div(class = "label", "Edit Quarter"),
+          div(class = "value", qtr)
+      ),
+      if (!is.null(w)) {
+        div(class = "revision-window-box",
+            tags$strong("Revision Window:"),
+            tags$br(),
+            paste(format_mmm_yy(w$start), "to", format_mmm_yy(w$end)),
+            tags$br(),
+            paste0("(", w$n_quarters, " quarters)")
+        )
+      }
+    )
+  })
+  
+  output$download_adj <- downloadHandler(
+    filename = function() {
+      paste0("adjustments_log_", format(Sys.Date(), "%Y%m%d"), ".csv")
+    },
+    content = function(file) {
+      ensure_log_file(rv$log_path)
+      file.copy(rv$log_path, file, overwrite = TRUE)
+    }
+  )
+  
+  output$download_notes <- downloadHandler(
+    filename = function() {
+      paste0("notes_log_", format(Sys.Date(), "%Y%m%d"), ".csv")
+    },
+    content = function(file) {
+      if (!is.null(rv$notes_path) && file.exists(rv$notes_path)) {
+        file.copy(rv$notes_path, file, overwrite = TRUE)
+      } else {
+        ensure_notes_file(file)
+      }
+    }
+  )
+  
+  # -------------------------
+  # Issuer Selector
+  # -------------------------
+  
+  observe({
+    iss_list <- issuers()
+    if (length(iss_list) > 0) {
+      updateSelectInput(session, "selected_issuer",
+                        choices = iss_list,
+                        selected = iss_list[1])
+    }
+  })
+  
+  selected_iss <- reactive({
+    input$selected_issuer
+  })
+  
+  output$issuer_status <- renderText({
+    iss <- selected_iss()
+    if (is.null(iss) || iss == "") return("Select an issuer to view data")
+    paste("Viewing Issuer Sector:", iss)
+  })
+  
+  # -------------------------
+  # Table Renderers
+  # -------------------------
+  
+  output$tbl_source <- renderDT({
+    iss <- selected_iss()
+    
+    if (isTRUE(rv$viewing_snapshot) && !is.null(rv$snapshot_data$final_data)) {
+      snap_data <- rv$snapshot_data$final_data
+      
+      if (is.null(iss) || iss == "" || !iss %in% unique(snap_data$issuer_sector)) {
+        return(datatable(data.frame(Message = "No snapshot data for this issuer"),
+                         options = list(dom = "t"), rownames = FALSE))
+      }
+      
+      mat <- snap_data %>%
+        filter(issuer_sector == iss) %>%
+        group_by(counterparty_sector, qtr) %>%
+        summarise(value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+        mutate(
+          Type = if_else(counterparty_sector == "000", "L", "A"),
+          Sector = if_else(counterparty_sector == "000", iss, counterparty_sector)
+        )
+      
+      if (nrow(mat) == 0) {
+        return(datatable(data.frame(Message = "No data"), options = list(dom = "t"), rownames = FALSE))
+      }
+      
+      mat <- build_wide_matrix(mat, "value", c("Type", "Sector", "counterparty_sector"))
+      mat <- mat %>% arrange(Type != "L", Sector) %>% select(-counterparty_sector)
+      mat <- add_qoq_columns(mat)
+      
+      change_col <- which(names(mat) == "Change")
+      qtr_cols <- which(grepl("^[A-Za-z]{3}-\\d{2}$", names(mat)))
+      format_cols <- c(qtr_cols, change_col)
+      
+      dt <- datatable(mat,
+                      extensions = 'FixedColumns',
+                      selection = "none",
+                      options = list(
+                        scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                        fixedColumns = list(leftColumns = 2),
+                        columnDefs = list(list(className = "dt-right", targets = "_all")),
+                        rowCallback = issuance_row_callback,
+                        initComplete = scroll_right_callback
+                      ),
+                      rownames = FALSE, width = "100%",
+                      caption = "SNAPSHOT VIEW - Source Values")
+      
+      if (length(format_cols) > 0) dt <- formatRound(dt, columns = format_cols, digits = 0)
+      return(dt)
+    }
+    
+    cl <- current_levels()
+    if (is.null(cl) || is.null(iss) || iss == "") {
+      return(datatable(data.frame(Message = "Loading..."), options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    mat <- tryCatch(build_source_matrix(cl, iss), error = function(e) data.frame(Message = paste("Error:", e$message)))
+    if (nrow(mat) == 0 || "Message" %in% names(mat)) {
+      return(datatable(if ("Message" %in% names(mat)) mat else data.frame(Message = "No data"),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    mat <- add_qoq_columns(mat)
+    
+    change_col <- which(names(mat) == "Change")
+    qtr_cols <- which(grepl("^[A-Za-z]{3}-\\d{2}$", names(mat)))
+    format_cols <- c(qtr_cols, change_col)
+    
+    dt <- datatable(mat,
+                    extensions = 'FixedColumns',
+                    selection = "none",
+                    options = list(
+                      scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                      fixedColumns = list(leftColumns = 2),
+                      columnDefs = list(list(className = "dt-right", targets = "_all")),
+                      rowCallback = issuance_row_callback,
+                      initComplete = scroll_right_callback
+                    ),
+                    rownames = FALSE, width = "100%")
+    if (length(format_cols) > 0) dt <- formatRound(dt, columns = format_cols, digits = 0)
+    dt
+  })
+  
+  output$tbl_source_resid <- renderDT({
+    iss <- selected_iss()
+    cl <- current_levels()
+    
+    if (is.null(cl) || is.null(iss) || iss == "") {
+      return(datatable(data.frame(Residual = "..."), options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    mat <- tryCatch(build_residual_row(cl, iss), error = function(e) data.frame(Message = paste("Error:", e$message)))
+    
+    datatable(mat,
+              extensions = 'FixedColumns',
+              selection = "none",
+              options = list(
+                scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                fixedColumns = list(leftColumns = 2),
+                initComplete = scroll_right_callback
+              ),
+              rownames = FALSE, width = "100%")
+  })
+  
+  output$tbl_adj <- renderDT({
+    iss <- selected_iss()
+    
+    if (isTRUE(rv$viewing_snapshot) && !is.null(rv$snapshot_data$final_data)) {
+      snap_data <- rv$snapshot_data$final_data
+      
+      if (is.null(iss) || iss == "" || !iss %in% unique(snap_data$issuer_sector)) {
+        return(datatable(data.frame(Message = "No snapshot data for this issuer"),
+                         options = list(dom = "t"), rownames = FALSE))
+      }
+      
+      mat <- snap_data %>%
+        filter(issuer_sector == iss) %>%
+        group_by(counterparty_sector, qtr) %>%
+        summarise(adj_delta = sum(effective_adj, na.rm = TRUE), .groups = "drop") %>%
+        mutate(
+          Type = if_else(counterparty_sector == "000", "L", "A"),
+          Sector = if_else(counterparty_sector == "000", iss, counterparty_sector)
+        )
+      
+      if (nrow(mat) == 0) {
+        return(datatable(data.frame(Message = "No adjustments in snapshot"),
+                         options = list(dom = "t"), rownames = FALSE))
+      }
+      
+      mat <- build_wide_matrix(mat, "adj_delta", c("Type", "Sector", "counterparty_sector"))
+      mat <- mat %>% arrange(Type != "L", Sector) %>% select(-counterparty_sector)
+      
+      dt <- datatable(mat,
+                      extensions = 'FixedColumns',
+                      selection = "none",
+                      options = list(
+                        scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                        fixedColumns = list(leftColumns = 2),
+                        columnDefs = list(list(className = "dt-right", targets = "_all")),
+                        rowCallback = issuance_row_callback,
+                        initComplete = scroll_right_callback
+                      ),
+                      rownames = FALSE, width = "100%",
+                      caption = "SNAPSHOT VIEW - Adjustments (Read-Only)")
+      if (ncol(mat) > 2) dt <- formatRound(dt, columns = 3:ncol(mat), digits = 0)
+      return(dt)
+    }
+    
+    if (is.null(iss) || iss == "") {
+      return(datatable(data.frame(Message = "Loading..."), options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    adj_long <- rv$adj_state[[iss]]
+    if (is.null(adj_long) || nrow(adj_long) == 0) {
+      return(datatable(data.frame(Message = "No adjustment data"), options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    mat <- tryCatch(build_adj_matrix(adj_long, iss), error = function(e) data.frame(Message = paste("Error:", e$message)))
+    if (nrow(mat) == 0 || "Message" %in% names(mat)) {
+      return(datatable(if ("Message" %in% names(mat)) mat else data.frame(Message = "No adjustment data"),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    dt <- datatable(mat,
+                    extensions = 'FixedColumns',
+                    selection = "none",
+                    options = list(
+                      scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                      fixedColumns = list(leftColumns = 2),
+                      columnDefs = list(
+                        list(className = "dt-right", targets = "_all"),
+                        list(visible = FALSE, targets = c(2, 3))
+                      ),
+                      rowCallback = issuance_row_callback,
+                      initComplete = scroll_right_callback
+                    ),
+                    editable = list(target = "cell", disable = list(columns = c(0, 1, 2, 3))),
+                    rownames = FALSE, width = "100%")
+    dt
+  })
+  
+  output$tbl_adj_resid <- renderDT({
+    iss <- selected_iss()
+    cl <- current_levels()
+    w <- tryCatch(revision_win(), error = function(e) NULL)
+    
+    if (is.null(iss) || iss == "" || is.null(cl) || is.null(w)) {
+      return(datatable(data.frame(Residual = "..."), options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    adj_long <- rv$adj_state[[iss]]
+    
+    source_df <- cl %>%
+      filter(issuer_sector == iss) %>%
+      filter(safe_grepl("^[A-Za-z]{3}[-]?\\d{2}$", qtr)) %>%
+      mutate(qtr = parse_quarter_label(qtr)) %>%
+      mutate(qtr_end = qtr_end_from_mmm_yy(qtr)) %>%
+      filter(qtr_end >= w$start & qtr_end <= w$end)
+    
+    if (nrow(source_df) == 0) {
+      return(datatable(data.frame(Residual = "N/A"), options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    issuance <- source_df %>%
+      filter(counterparty_sector == "000") %>%
+      group_by(qtr, qtr_end) %>%
+      summarise(issuance = sum(value, na.rm = TRUE), .groups = "drop")
+    
+    holders_source <- source_df %>%
+      filter(counterparty_sector != "000") %>%
+      group_by(qtr, qtr_end) %>%
+      summarise(holders = sum(value, na.rm = TRUE), .groups = "drop")
+    
+    source_resid <- issuance %>%
+      left_join(holders_source %>% select(qtr, holders), by = "qtr") %>%
+      mutate(
+        holders = coalesce(holders, 0),
+        source_residual = issuance - holders
+      )
+    
+    if (!is.null(adj_long) && nrow(adj_long) > 0) {
+      holder_adj <- adj_long %>%
+        filter(counterparty_sector != "000") %>%
+        mutate(qtr = parse_quarter_label(qtr)) %>%
+        mutate(qtr_end = qtr_end_from_mmm_yy(qtr)) %>%
+        filter(qtr_end >= w$start & qtr_end <= w$end) %>%
+        group_by(qtr) %>%
+        summarise(total_adj = sum(adj_delta, na.rm = TRUE), .groups = "drop")
+    } else {
+      holder_adj <- data.frame(qtr = character(), total_adj = numeric())
+    }
+    
+    adj_resid <- source_resid %>%
+      left_join(holder_adj, by = "qtr") %>%
+      mutate(
+        total_adj = coalesce(total_adj, 0),
+        adj_residual = round(source_residual + total_adj, 0)
+      )
+    
+    result <- data.frame(Type = "Remaining", Sector = "Unallocated")
+    qtr_order <- adj_resid %>% arrange(qtr_end) %>% pull(qtr)
+    
+    for (q in qtr_order) {
+      val <- adj_resid %>% filter(qtr == q) %>% pull(adj_residual)
+      result[[q]] <- if (length(val) > 0) val else NA
+    }
+    
+    datatable(result,
+              extensions = 'FixedColumns',
+              selection = "none",
+              options = list(
+                scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                fixedColumns = list(leftColumns = 2),
+                initComplete = scroll_right_callback
+              ),
+              rownames = FALSE, width = "100%")
+  })
+  
+  output$tbl_final <- renderDT({
+    iss <- selected_iss()
+    
+    if (isTRUE(rv$viewing_snapshot) && !is.null(rv$snapshot_data$final_data)) {
+      snap_data <- rv$snapshot_data$final_data
+      
+      if (is.null(iss) || iss == "" || !iss %in% unique(snap_data$issuer_sector)) {
+        return(datatable(data.frame(Message = "No snapshot data for this issuer"),
+                         options = list(dom = "t"), rownames = FALSE))
+      }
+      
+      mat <- snap_data %>%
+        filter(issuer_sector == iss) %>%
+        group_by(counterparty_sector, qtr) %>%
+        summarise(final_value = sum(final_value, na.rm = TRUE), .groups = "drop") %>%
+        mutate(
+          Type = if_else(counterparty_sector == "000", "L", "A"),
+          Sector = if_else(counterparty_sector == "000", iss, counterparty_sector)
+        )
+      
+      if (nrow(mat) == 0) {
+        return(datatable(data.frame(Message = "No data"), options = list(dom = "t"), rownames = FALSE))
+      }
+      
+      mat <- build_wide_matrix(mat, "final_value", c("Type", "Sector", "counterparty_sector"))
+      mat <- mat %>% arrange(Type != "L", Sector) %>% select(-counterparty_sector)
+      mat <- add_qoq_columns(mat)
+      
+      change_col <- which(names(mat) == "Change")
+      qtr_cols <- which(grepl("^[A-Za-z]{3}-\\d{2}$", names(mat)))
+      format_cols <- c(qtr_cols, change_col)
+      
+      dt <- datatable(mat,
+                      extensions = 'FixedColumns',
+                      selection = "none",
+                      options = list(
+                        scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                        fixedColumns = list(leftColumns = 2),
+                        columnDefs = list(list(className = "dt-right", targets = "_all")),
+                        rowCallback = issuance_row_callback,
+                        initComplete = scroll_right_callback
+                      ),
+                      rownames = FALSE, width = "100%",
+                      caption = "SNAPSHOT VIEW - Final Values (Source + Adjustments)")
+      if (length(format_cols) > 0) dt <- formatRound(dt, columns = format_cols, digits = 0)
+      return(dt)
+    }
+    
+    cl <- current_levels()
+    if (is.null(cl) || is.null(iss) || iss == "") {
+      return(datatable(data.frame(Message = "Loading..."), options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    adj_long <- rv$adj_state[[iss]]
+    w <- tryCatch(revision_win(), error = function(e) NULL)
+    if (is.null(w)) {
+      return(datatable(data.frame(Message = "Load data first"), options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    mat <- tryCatch(build_final_matrix(cl, adj_long, iss, w), error = function(e) data.frame(Message = paste("Error:", e$message)))
+    if (nrow(mat) == 0 || "Message" %in% names(mat)) {
+      return(datatable(if ("Message" %in% names(mat)) mat else data.frame(Message = "No data"),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    mat <- add_qoq_columns(mat)
+    
+    change_col <- which(names(mat) == "Change")
+    qtr_cols <- which(grepl("^[A-Za-z]{3}-\\d{2}$", names(mat)))
+    format_cols <- c(qtr_cols, change_col)
+    
+    dt <- datatable(mat,
+                    extensions = 'FixedColumns',
+                    selection = "none",
+                    options = list(
+                      scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                      fixedColumns = list(leftColumns = 2),
+                      columnDefs = list(list(className = "dt-right", targets = "_all")),
+                      rowCallback = issuance_row_callback,
+                      initComplete = scroll_right_callback
+                    ),
+                    rownames = FALSE, width = "100%")
+    if (length(format_cols) > 0) dt <- formatRound(dt, columns = format_cols, digits = 0)
+    dt
+  })
+  
+  output$tbl_rev <- renderDT({
+    iss <- selected_iss()
+    cl <- current_levels()
+    ol <- old_levels()
+    
+    if (is.null(cl) || is.null(ol) || is.null(iss) || iss == "") {
+      return(datatable(data.frame(Message = "No revision data"), options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    mat <- tryCatch(build_revisions_matrix(cl, ol, iss), error = function(e) data.frame(Message = paste("Error:", e$message)))
+    if (nrow(mat) == 0 || "Message" %in% names(mat)) {
+      return(datatable(if ("Message" %in% names(mat)) mat else data.frame(Message = "No revision data"),
+                       options = list(dom = "t"), rownames = FALSE))
+    }
+    
+    dt <- datatable(mat,
+                    extensions = 'FixedColumns',
+                    selection = "none",
+                    options = list(
+                      scrollX = TRUE, paging = FALSE, dom = "t", autoWidth = FALSE,
+                      fixedColumns = list(leftColumns = 2),
+                      columnDefs = list(list(className = "dt-right", targets = "_all")),
+                      rowCallback = issuance_row_callback,
+                      initComplete = scroll_right_callback
+                    ),
+                    rownames = FALSE, width = "100%")
+    if (ncol(mat) > 2) dt <- formatRound(dt, columns = 3:ncol(mat), digits = 0)
+    dt
+  })
+  
+  # -------------------------
+  # Edit Handlers
+  # -------------------------
+  
+  observeEvent(input$tbl_adj_cell_edit, {
+    info <- input$tbl_adj_cell_edit
+    req(info)
+    
+    issuer <- selected_iss()
+    if (is.null(issuer)) return()
+    
+    adj_long <- rv$adj_state[[issuer]]
+    if (is.null(adj_long) || nrow(adj_long) == 0) return()
+    
+    mat <- build_adj_matrix(adj_long, issuer)
+    
+    r <- info$row
+    c <- info$col + 1
+    v <- suppressWarnings(as.numeric(info$value))
+    if (is.na(v)) v <- 0
+    
+    if (c < 1 || c > ncol(mat)) return()
+    
+    colname <- names(mat)[c]
+    
+    if (colname %in% c("Type", "Sector", "instrument", "counterparty_sector")) return()
+    
+    row_data <- mat[r, ]
+    row_cpty <- as.character(row_data$counterparty_sector)
+    
+    if (row_cpty == "000") {
+      showNotification("Cannot edit issuance rows", type = "warning")
+      return()
+    }
+    
+    row_instrument <- as.character(row_data$instrument)
+    qtr <- colname
+    
+    idx <- which(
+      adj_long$instrument == row_instrument &
+        adj_long$counterparty_sector == row_cpty &
+        adj_long$qtr == qtr
+    )
+    
+    if (length(idx) == 1) {
+      adj_long$adj_delta[idx] <- v
+      inst_class <- adj_long$inst_class[idx]
+      
+      append_adjustment(rv$log_path, inst_class, row_instrument, issuer,
+                        row_cpty, qtr, v)
+      
+      rv$adj_state[[issuer]] <- adj_long
+      
+      new_mat <- build_adj_matrix(adj_long, issuer)
+      proxy <- dataTableProxy("tbl_adj")
+      replaceData(proxy, new_mat, resetPaging = FALSE, rownames = FALSE)
+      
+      mark_changed_cells()
+      showNotification(paste("Updated", qtr, ":", v), type = "message", duration = 2)
+    }
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$paste_event, {
+    ev <- input$paste_event
+    req(ev$row, ev$col, ev$text)
+    
+    issuer <- selected_iss()
+    if (is.null(issuer) || !issuer %in% issuers()) return()
+    
+    adj_long <- rv$adj_state[[issuer]]
+    if (is.null(adj_long) || nrow(adj_long) == 0) return()
+    
+    mat <- build_adj_matrix(adj_long, issuer)
+    
+    start_r <- as.integer(ev$row)
+    start_c <- as.integer(ev$col)
+    
+    lines <- strsplit(ev$text, "\r\n|\n|\r")[[1]]
+    lines <- lines[nzchar(lines)]
+    grid <- lapply(lines, function(line) strsplit(line, "\t")[[1]])
+    
+    updates_made <- 0
+    
+    for (i in seq_along(grid)) {
+      for (j in seq_along(grid[[i]])) {
+        rr <- start_r + (i - 1)
+        cc <- start_c + (j - 1)
+        
+        if (rr < 1 || rr > nrow(mat) || cc < 1 || cc > ncol(mat)) next
+        
+        colname <- names(mat)[cc]
+        if (colname %in% c("Type", "Sector", "instrument", "counterparty_sector")) next
+        
+        row_data <- mat[rr, ]
+        row_cpty <- as.character(row_data$counterparty_sector)
+        if (row_cpty == "000") next
+        
+        v <- suppressWarnings(as.numeric(grid[[i]][j]))
+        if (is.na(v)) v <- 0
+        
+        row_instrument <- as.character(row_data$instrument)
+        qtr <- colname
+        
+        idx <- which(
+          adj_long$instrument == row_instrument &
+            adj_long$counterparty_sector == row_cpty &
+            adj_long$qtr == qtr
+        )
+        
+        if (length(idx) == 1) {
+          adj_long$adj_delta[idx] <- v
+          inst_class <- adj_long$inst_class[idx]
+          append_adjustment(rv$log_path, inst_class, row_instrument, issuer,
+                            row_cpty, qtr, v)
+          updates_made <- updates_made + 1
+        }
+      }
+    }
+    
+    rv$adj_state[[issuer]] <- adj_long
+    
+    new_mat <- build_adj_matrix(adj_long, issuer)
+    proxy <- dataTableProxy("tbl_adj")
+    replaceData(proxy, new_mat, resetPaging = FALSE, rownames = FALSE)
+    
+    mark_changed_cells()
+    
+    if (updates_made > 0) showNotification(paste(updates_made, "cells updated"), type = "message")
+  }, ignoreInit = TRUE)
+}
+
+# ============================================================
+# PART 10 — RUN APP
+# ============================================================
+
+shinyApp(ui, server)
